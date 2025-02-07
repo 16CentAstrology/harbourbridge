@@ -1,4 +1,4 @@
-table.mat-table {
+table.mat-mdc-table {
   width: 100%;
 }
 
@@ -10,35 +10,61 @@ table.mat-table {
   vertical-align: inherit;
 }
 
-.mat-header-cell{
+.mat-mdc-header-cell {
   border-style: none;
- 
+
 }
 
-.icons{
-  border-left:1px solid rgb(208, 204, 204);
-  padding-left: 10px ;
-  
+.icons {
+  border-left: 1px solid rgb(208, 204, 204);
+  padding-left: 10px;
 }
-.cells{
+
+.cells {
   text-align: center;
 }
 
-.sidenav-view-assessment-container{
-  .sidenav-view-assessment-header{
-    padding:5px 20px;
+.sidenav-view-assessment-container {
+  .sidenav-view-assessment-header {
+    padding: 7px 16px;
     display: flex;
     flex-direction: row;
-    justify-content: space-between;
     align-items: center;
-    border-bottom: 1px solid rgb(208, 204, 204);
-    .header-title{
-        margin:0;
-    }
-  }
+    border-bottom: 1px solid #d0cccc;
+    justify-content: space-between;
 
-  .content{
-    padding-left: 15px;
-    padding-top: 10px;
+    .header-title {
+      margin: 0;
+    }
+
+    .btn-source-select {
+      vertical-align: middle;
+
+      .reportsButtons {
+        white-space: nowrap;
+        vertical-align: middle
+      }
+
+      .split-button-left {
+        border-top-right-radius: 0;
+        border-bottom-right-radius: 0;
+      }
+
+      .split-button-right {
+        width: 30px !important;
+        min-width: unset !important;
+        padding: 0 8px 0 2px;
+        border-top-left-radius: 0;
+        border-bottom-left-radius: 0;
+        border-left: 1px solid #fafafa;
+      }
+
+      .close-button {
+        margin-left: 1.25px;
+        padding: 0;
+        height: 10px;
+        vertical-align: text-top;
+      }
+    }
   }
 }

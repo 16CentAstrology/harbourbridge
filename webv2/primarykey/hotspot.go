@@ -15,9 +15,9 @@
 package primarykey
 
 import (
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
 )
 
 // DetectHotspot adds hotspot detected suggestion in schema conversion process for database.
@@ -27,7 +27,7 @@ func DetectHotspot() {
 
 	for _, spannerTable := range sessionState.Conv.SpSchema {
 
-		isHotSpot(spannerTable.Pks, spannerTable)
+		isHotSpot(spannerTable.PrimaryKeys, spannerTable)
 	}
 
 }
@@ -42,21 +42,21 @@ func isHotSpot(insert []ddl.IndexKey, spannerTable ddl.CreateTable) {
 // hotspotTimestamp checks Timestamp hotspot.
 // If present adds HotspotTimestamp as an issue in Issues.
 func hotspotTimestamp(insert []ddl.IndexKey, spannerTable ddl.CreateTable) {
+	sessionState := session.GetSessionState()
 
 	for i := 0; i < len(insert); i++ {
 
 		for _, c := range spannerTable.ColDefs {
 
-			if insert[i].Col == c.Name {
+			if insert[i].ColId == c.Id {
 
 				if c.T.Name == ddl.Timestamp {
 
-					columnname := insert[i].Col
-					sessionState := session.GetSessionState()
-					schemaissue := sessionState.Conv.Issues[spannerTable.Name][columnname]
+					columnId := insert[i].ColId
+					schemaissue := sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId]
 
 					schemaissue = append(schemaissue, internal.HotspotTimestamp)
-					sessionState.Conv.Issues[spannerTable.Name][columnname] = schemaissue
+					sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId] = schemaissue
 				}
 
 			}
@@ -71,7 +71,7 @@ func hotspotAutoincrement(insert []ddl.IndexKey, spannerTable ddl.CreateTable) {
 
 	for i := 0; i < len(insert); i++ {
 		for _, c := range spannerTable.ColDefs {
-			if insert[i].Col == c.Name {
+			if insert[i].ColId == c.Name {
 				spannerColumnId := c.Id
 				detecthotspotAutoincrement(spannerTable, spannerColumnId)
 			}
@@ -85,7 +85,7 @@ func hotspotAutoincrement(insert []ddl.IndexKey, spannerTable ddl.CreateTable) {
 func detecthotspotAutoincrement(spannerTable ddl.CreateTable, spannerColumnId string) {
 
 	sessionState := session.GetSessionState()
-	sourcetable := sessionState.Conv.SrcSchema[spannerTable.Name]
+	sourcetable := sessionState.Conv.SrcSchema[spannerTable.Id]
 
 	for _, s := range sourcetable.ColDefs {
 
@@ -93,12 +93,11 @@ func detecthotspotAutoincrement(spannerTable ddl.CreateTable, spannerColumnId st
 
 			if s.Ignored.AutoIncrement {
 
-				columnname := s.Name
-				sessionState := session.GetSessionState()
-				schemaissue := sessionState.Conv.Issues[spannerTable.Name][columnname]
+				columnId := s.Id
+				schemaissue := sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId]
 
 				schemaissue = append(schemaissue, internal.HotspotAutoIncrement)
-				sessionState.Conv.Issues[spannerTable.Name][columnname] = schemaissue
+				sessionState.Conv.SchemaIssues[spannerTable.Id].ColumnLevelIssues[columnId] = schemaissue
 
 			}
 

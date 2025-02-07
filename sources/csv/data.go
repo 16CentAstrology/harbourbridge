@@ -28,21 +28,29 @@ import (
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/profiles"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/profiles"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
+type CsvInterface interface {
+	GetCSVFiles(conv *internal.Conv, sourceProfile profiles.SourceProfile) (tables []utils.ManifestTable, err error)
+	SetRowStats(conv *internal.Conv, tables []utils.ManifestTable, delimiter rune) error
+	ProcessCSV(conv *internal.Conv, tables []utils.ManifestTable, nullStr string, delimiter rune) error
+}
+
+type CsvImpl struct{}
+
 // GetCSVFiles finds the appropriate files paths and downloads gcs files in any.
-func GetCSVFiles(conv *internal.Conv, sourceProfile profiles.SourceProfile) (tables []utils.ManifestTable, err error) {
+func (c *CsvImpl) GetCSVFiles(conv *internal.Conv, sourceProfile profiles.SourceProfile) (tables []utils.ManifestTable, err error) {
 	// If manifest file not provided, we assume the csvs exist in the same directory
 	// in table_name.csv format.
 	if sourceProfile.Csv.Manifest == "" {
 		fmt.Println("Manifest file not provided, checking for files named `[table_name].csv` in current working directory...")
-		for t := range conv.SpSchema {
-			tables = append(tables, utils.ManifestTable{Table_name: t, File_patterns: []string{fmt.Sprintf("%s.csv", t)}})
+		for _, schema := range conv.SpSchema {
+			tables = append(tables, utils.ManifestTable{Table_name: schema.Name, File_patterns: []string{fmt.Sprintf("%s.csv", schema.Name)}})
 		}
 	} else {
 		fmt.Println("Manifest file provided, reading csv file paths...")
@@ -87,16 +95,16 @@ func VerifyManifest(conv *internal.Conv, tables []utils.ManifestTable) error {
 		return fmt.Errorf("no tables found")
 	}
 	missing := []string{}
-	for name := range conv.SrcSchema {
+	for _, v := range conv.SrcSchema {
 		found := false
 		for _, table := range tables {
-			if name == table.Table_name {
+			if v.Name == table.Table_name {
 				found = true
 				break
 			}
 		}
 		if !found {
-			missing = append(missing, name)
+			missing = append(missing, v.Name)
 		}
 	}
 	if len(missing) > 0 {
@@ -108,7 +116,8 @@ func VerifyManifest(conv *internal.Conv, tables []utils.ManifestTable) error {
 		if name == "" {
 			return fmt.Errorf("table number %d (0-indexed) does not have a name", i)
 		}
-		if _, ok := conv.SrcSchema[name]; !ok {
+		_, err := internal.GetTableIdFromSrcName(conv.SrcSchema, name)
+		if err != nil {
 			return fmt.Errorf("table %s provided in manifest does not exist in spanner", name)
 		}
 		if len(table.File_patterns) == 0 {
@@ -119,7 +128,7 @@ func VerifyManifest(conv *internal.Conv, tables []utils.ManifestTable) error {
 }
 
 // SetRowStats calculates the number of rows per table.
-func SetRowStats(conv *internal.Conv, tables []utils.ManifestTable, delimiter rune) error {
+func (c *CsvImpl) SetRowStats(conv *internal.Conv, tables []utils.ManifestTable, delimiter rune) error {
 	for _, table := range tables {
 		for _, filePath := range table.File_patterns {
 			csvFile, err := os.Open(filePath)
@@ -128,7 +137,16 @@ func SetRowStats(conv *internal.Conv, tables []utils.ManifestTable, delimiter ru
 			}
 			r := csvReader.NewReader(csvFile)
 			r.Comma = delimiter
-			count, err := getCSVDataRowCount(r, conv.SpSchema[table.Table_name].ColNames)
+
+			tableId, err := internal.GetTableIdFromSpName(conv.SpSchema, table.Table_name)
+			if err != nil {
+				return fmt.Errorf("table Id not found for spanner table %v", table.Table_name)
+			}
+			colNames := []string{}
+			for _, colIds := range conv.SpSchema[tableId].ColIds {
+				colNames = append(colNames, conv.SpSchema[tableId].ColDefs[colIds].Name)
+			}
+			count, err := getCSVDataRowCount(r, colNames)
 			if err != nil {
 				return fmt.Errorf("error reading file %s for table %s: %v", filePath, table.Table_name, err)
 			}
@@ -174,15 +192,15 @@ func getCSVDataRowCount(r *csvReader.Reader, colNames []string) (int64, error) {
 
 // ProcessCSV writes data across the tables provided in the manifest file. Each table's data can be provided
 // across multiple CSV files hence, the manifest accepts a list of file paths in the input.
-func ProcessCSV(conv *internal.Conv, tables []utils.ManifestTable, nullStr string, delimiter rune) error {
-	orderedTableNames := ddl.OrderTables(conv.SpSchema)
+func (c *CsvImpl) ProcessCSV(conv *internal.Conv, tables []utils.ManifestTable, nullStr string, delimiter rune) error {
+	tableIds := ddl.GetSortedTableIdsBySpName(conv.SpSchema)
 	nameToFiles := map[string][]string{}
 	for _, table := range tables {
 		nameToFiles[table.Table_name] = table.File_patterns
 	}
 	orderedTables := []utils.ManifestTable{}
-	for _, name := range orderedTableNames {
-		orderedTables = append(orderedTables, utils.ManifestTable{name, nameToFiles[name]})
+	for _, id := range tableIds {
+		orderedTables = append(orderedTables, utils.ManifestTable{conv.SpSchema[id].Name, nameToFiles[conv.SpSchema[id].Name]})
 	}
 
 	for _, table := range orderedTables {
@@ -195,7 +213,16 @@ func ProcessCSV(conv *internal.Conv, tables []utils.ManifestTable, nullStr strin
 			r.Comma = delimiter
 
 			// Default column order is same as in Spanner schema.
-			colNames := conv.SpSchema[table.Table_name].ColNames
+			tableId, err := internal.GetTableIdFromSpName(conv.SpSchema, table.Table_name)
+			if err != nil {
+				return fmt.Errorf("table Id not found for spanner table %v", table.Table_name)
+			}
+
+			colNames := []string{}
+			for _, v := range conv.SpSchema[tableId].ColIds {
+				colNames = append(colNames, conv.SpSchema[tableId].ColDefs[v].Name)
+			}
+
 			srcCols, err := r.Read()
 			if err == io.EOF {
 				conv.Unexpected(fmt.Sprintf("error processing table %s: file %s is empty.", table.Table_name, filePath))
@@ -247,15 +274,25 @@ func processDataRow(conv *internal.Conv, nullStr, tableName string, srcCols []st
 func convertData(conv *internal.Conv, nullStr, tableName string, srcCols []string, values []string) ([]string, []interface{}, error) {
 	var v []interface{}
 	var cvtCols []string
-	colDefs := conv.SpSchema[tableName].ColDefs
+
+	tableId, err := internal.GetTableIdFromSpName(conv.SpSchema, tableName)
+	if err != nil {
+		return cvtCols, v, fmt.Errorf("table Id not found for spanner table %v", tableName)
+	}
+
+	colDefs := conv.SpSchema[tableId].ColDefs
 	for i, val := range values {
 		if val == nullStr {
 			continue
 		}
 		colName := srcCols[i]
-		spColDef := colDefs[colName]
+		colId, err := internal.GetColIdFromSpName(conv.SpSchema[tableId].ColDefs, colName)
+		if err != nil {
+			return cvtCols, v, fmt.Errorf("column Id not found for spanner table %v column %v", tableName, colName)
+		}
+		spColDef := colDefs[colId]
+
 		var x interface{}
-		var err error
 		if spColDef.T.IsArray {
 			x, err = convArray(spColDef.T, val)
 		} else {
@@ -340,6 +377,24 @@ func convArray(spannerType ddl.Type, val string) (interface{}, error) {
 				return []spanner.NullDate{}, err
 			}
 			r = append(r, spanner.NullDate{Date: date, Valid: true})
+		}
+		return r, nil
+	case ddl.Float32:
+		var r []spanner.NullFloat32
+		for _, s := range a {
+			if s == "NULL" {
+				r = append(r, spanner.NullFloat32{Valid: false})
+				continue
+			}
+			s, err := processQuote(s)
+			if err != nil {
+				return []spanner.NullFloat32{}, err
+			}
+			f, err := convFloat32(s)
+			if err != nil {
+				return []spanner.NullFloat32{}, err
+			}
+			r = append(r, spanner.NullFloat32{Float32: f, Valid: true})
 		}
 		return r, nil
 	case ddl.Float64:
@@ -440,12 +495,14 @@ func convScalar(conv *internal.Conv, spannerType ddl.Type, val string) (interfac
 		return convBytes(val)
 	case ddl.Date:
 		return convDate(val)
+	case ddl.Float32:
+		return convFloat32(val)
 	case ddl.Float64:
 		return convFloat64(val)
 	case ddl.Int64:
 		return convInt64(val)
 	case ddl.Numeric:
-		if conv.TargetDb == constants.TargetExperimentalPostgres {
+		if conv.SpDialect == constants.DIALECT_POSTGRESQL {
 			return spanner.PGNumeric{Numeric: val, Valid: true}, nil
 		}
 		return convNumeric(val)
@@ -480,6 +537,14 @@ func convDate(val string) (civil.Date, error) {
 		return d, fmt.Errorf("can't convert to date: %w", err)
 	}
 	return d, err
+}
+
+func convFloat32(val string) (float32, error) {
+	f, err := strconv.ParseFloat(val, 32)
+	if err != nil {
+		return float32(f), fmt.Errorf("can't convert to float32: %w", err)
+	}
+	return float32(f), err
 }
 
 func convFloat64(val string) (float64, error) {

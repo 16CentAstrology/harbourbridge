@@ -15,23 +15,11 @@
 package primarykey
 
 import (
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
-	utilities "github.com/cloudspannerecosystem/harbourbridge/webv2/utilities"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
+	utilities "github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/utilities"
 )
-
-// getColumnId return ColumnId for given columnName.
-func getColumnId(spannerTable ddl.CreateTable, columnName string) string {
-
-	var id string
-	for _, col := range spannerTable.ColDefs {
-		if col.Name == columnName {
-			id = col.Id
-		}
-	}
-	return id
-}
 
 // getSpannerTable return spannerTable for given TableId.
 func getSpannerTable(sessionState *session.SessionState, pkRequest PrimaryKeyRequest) (spannerTable ddl.CreateTable, found bool) {
@@ -46,25 +34,13 @@ func getSpannerTable(sessionState *session.SessionState, pkRequest PrimaryKeyReq
 	return spannerTable, found
 }
 
-// getColumnName return columnName for given columnId.
-func getColumnName(spannerTable ddl.CreateTable, columnId string) string {
-
-	var columnName string
-	for _, col := range spannerTable.ColDefs {
-		if col.Id == columnId {
-			columnName = col.Name
-		}
-	}
-	return columnName
-}
-
 // getColumnIdListFromPrimaryKeyRequest return list of column Id from PrimaryKeyRequest.
 func getColumnIdListFromPrimaryKeyRequest(pkRequest PrimaryKeyRequest) []string {
 
 	cidlist := []string{}
 
 	for i := 0; i < len(pkRequest.Columns); i++ {
-		cidlist = append(cidlist, pkRequest.Columns[i].ColumnId)
+		cidlist = append(cidlist, pkRequest.Columns[i].ColId)
 	}
 	return cidlist
 }
@@ -73,9 +49,8 @@ func getColumnIdListFromPrimaryKeyRequest(pkRequest PrimaryKeyRequest) []string 
 func getColumnIdListOfSpannerTablePrimaryKey(spannerTable ddl.CreateTable) []string {
 	cidlist := []string{}
 
-	for i := 0; i < len(spannerTable.Pks); i++ {
-		cid := getColumnId(spannerTable, spannerTable.Pks[i].Col)
-		cidlist = append(cidlist, cid)
+	for i := 0; i < len(spannerTable.PrimaryKeys); i++ {
+		cidlist = append(cidlist, spannerTable.PrimaryKeys[i].ColId)
 	}
 	return cidlist
 }
@@ -104,21 +79,22 @@ func isValidColumnIds(pkRequest PrimaryKeyRequest, spannertable ddl.CreateTable)
 }
 
 func RemoveInterleave(conv *internal.Conv, spannertable ddl.CreateTable) {
-	if spannertable.Parent != "" {
+	if spannertable.ParentTable.Id != "" {
 		var childPkFirstColumn string
 		var parentPkFirstColumn string
-		for i := 0; i < len(spannertable.Pks); i++ {
-			if spannertable.Pks[i].Order == 1 {
-				childPkFirstColumn = spannertable.Pks[i].Col
+		for i := 0; i < len(spannertable.PrimaryKeys); i++ {
+			if spannertable.PrimaryKeys[i].Order == 1 {
+				childPkFirstColumn = spannertable.PrimaryKeys[i].ColId
 			}
 		}
-		for i := 0; i < len(conv.SpSchema[spannertable.Parent].Pks); i++ {
-			if conv.SpSchema[spannertable.Parent].Pks[i].Order == 1 {
-				parentPkFirstColumn = conv.SpSchema[spannertable.Parent].Pks[i].Col
+		for i := 0; i < len(conv.SpSchema[spannertable.ParentTable.Id].PrimaryKeys); i++ {
+			if conv.SpSchema[spannertable.ParentTable.Id].PrimaryKeys[i].Order == 1 {
+				parentPkFirstColumn = conv.SpSchema[spannertable.ParentTable.Id].PrimaryKeys[i].ColId
 			}
 		}
 		if childPkFirstColumn != parentPkFirstColumn {
-			spannertable.Parent = ""
+			spannertable.ParentTable.Id = ""
+			spannertable.ParentTable.OnDelete = ""
 			conv.SpSchema[spannertable.Name] = spannertable
 		}
 	}

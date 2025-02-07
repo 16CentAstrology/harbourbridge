@@ -17,37 +17,45 @@ package utilities
 import (
 	"fmt"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/mysql"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/oracle"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/postgres"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/sqlserver"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/mysql"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/oracle"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/postgres"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/sqlserver"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
 )
 
-func GetType(conv *internal.Conv, newType, table, colName string, srcTableName string) (ddl.CreateTable, ddl.Type, error) {
+func GetType(conv *internal.Conv, newType, tableId, colId string) (ddl.CreateTable, ddl.Type, error) {
 	sessionState := session.GetSessionState()
 
-	sp := conv.SpSchema[table]
-	srcColName := conv.ToSource[table].Cols[colName]
-	srcCol := conv.SrcSchema[srcTableName].ColDefs[srcColName]
+	sp := conv.SpSchema[tableId]
+	srcCol := conv.SrcSchema[tableId].ColDefs[colId]
+	isPk := common.IsPrimaryKey(colId, conv.SrcSchema[tableId])
 	var ty ddl.Type
 	var issues []internal.SchemaIssue
+	var toddl common.ToDdl
 	switch sessionState.Driver {
 	case constants.MYSQL, constants.MYSQLDUMP:
-		ty, issues = mysql.ToSpannerTypeWeb(srcCol.Type.Name, newType, srcCol.Type.Mods)
+		toddl = mysql.InfoSchemaImpl{}.GetToDdl()
+		ty, issues = toddl.ToSpannerType(conv, newType, srcCol.Type, isPk)
 	case constants.PGDUMP, constants.POSTGRES:
-		ty, issues = postgres.ToSpannerTypeWeb(srcCol.Type.Name, newType, srcCol.Type.Mods)
+		toddl = postgres.InfoSchemaImpl{}.GetToDdl()
+		ty, issues = toddl.ToSpannerType(conv, newType, srcCol.Type, isPk)
 	case constants.SQLSERVER:
-		ty, issues = sqlserver.ToSpannerTypeWeb(srcCol.Type.Name, newType, srcCol.Type.Mods)
+		toddl = sqlserver.InfoSchemaImpl{}.GetToDdl()
+		ty, issues = toddl.ToSpannerType(conv, newType, srcCol.Type, isPk)
 	case constants.ORACLE:
-		ty, issues = oracle.ToSpannerTypeWeb(conv, newType, srcCol.Type.Name, srcCol.Type.Mods)
+		toddl = oracle.InfoSchemaImpl{}.GetToDdl()
+		ty, issues = toddl.ToSpannerType(conv, newType, srcCol.Type, isPk)
 	default:
 		return sp, ty, fmt.Errorf("driver : '%s' is not supported", sessionState.Driver)
 	}
-	if len(srcCol.Type.ArrayBounds) > 1 {
+	if len(srcCol.Type.ArrayBounds) > 0 && conv.SpDialect == constants.DIALECT_POSTGRESQL {
+		ty = ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
+	} else if len(srcCol.Type.ArrayBounds) > 1 {
 		ty = ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
 		issues = append(issues, internal.MultiDimensionalArray)
 	}
@@ -57,8 +65,8 @@ func GetType(conv *internal.Conv, newType, table, colName string, srcTableName s
 	if srcCol.Ignored.AutoIncrement {
 		issues = append(issues, internal.AutoIncrement)
 	}
-	if conv.Issues != nil && len(issues) > 0 {
-		conv.Issues[srcTableName][srcCol.Name] = issues
+	if conv.SchemaIssues != nil && len(issues) > 0 {
+		conv.SchemaIssues[tableId].ColumnLevelIssues[colId] = issues
 	}
 	ty.IsArray = len(srcCol.Type.ArrayBounds) == 1
 	return sp, ty, nil

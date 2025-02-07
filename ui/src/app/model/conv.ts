@@ -1,11 +1,13 @@
-import { IRule } from './rule'
+import ICreateSequence from './auto-gen'
+import { AutoGen } from './edit-table'
+import IRule from './rule'
 
 export default interface IConv {
   SpSchema: Record<string, ICreateTable>
   SyntheticPKeys: Record<string, ISyntheticPKey>
   SrcSchema: Record<string, ITable>
+  SchemaIssues: Record<string, number>[]
   Rules: IRule[]
-  Issues: Record<string, number>[]
   ToSpanner: Record<string, NameAndCols>
   ToSource: Record<string, NameAndCols>
   UsedNames: Record<string, boolean>
@@ -16,12 +18,20 @@ export default interface IConv {
   DatabaseType: string
   DatabaseName: string
   EditorName: string
-  Audit: IAudit
+  SpDialect: string
+  IsSharded: boolean
+  SpSequences: Record<string, ICreateSequence>
+  SrcSequences: Record<string, ICreateSequence>
 }
 
-export interface IAudit {
-  ToSpannerFkIdx: Record<string, IFkeyAndIdxs>
-  ToSourceFkIdx: Record<string, IFkeyAndIdxs>
+export interface IDefaultValue {
+  IsPresent: boolean
+  Value: IExpression
+}
+
+export interface IExpression {
+  Statement: string
+  ExpressionId: string
 }
 
 export interface IFkeyAndIdxs {
@@ -43,15 +53,16 @@ export interface NameAndCols {
   Cols: Record<string, string>
 }
 
-// Spanner schema
+// Source schema
 export interface ITable {
   Name: string
   Id: string
   Schema: string
-  ColNames: string[]
+  ColIds: string[]
   ColDefs: Record<string, IColumn>
   PrimaryKeys: ISrcIndexKey[]
-  ForeignKeys: ISpannerForeignKey[]
+  ForeignKeys: IForeignKey[]
+  CheckConstraints: ICheckConstraints[]
   Indexes: IIndex[]
 }
 
@@ -61,6 +72,8 @@ export interface IColumn {
   NotNull: boolean
   Ignored: IIgnored
   Id: string
+  AutoGen: AutoGen
+  DefaultValue: IDefaultValue
 }
 
 export interface IIgnored {
@@ -85,32 +98,29 @@ export interface IIndex {
   Id: string
 }
 
-export interface ISpannerForeignKey {
-  Name: string
-  Columns: string[]
-  ReferTable: string
-  ReferColumns: string[]
-  OnDelete: string
-  OnUpdate: string
+export interface IInterleavedParent{
   Id: string
+  OnDelete: string
 }
 
-// source schema
+// spanner schema
 export interface ICreateTable {
   Name: string
-  ColNames: string[]
+  ColIds: string[]
+  ShardIdColumn: string
   ColDefs: Record<string, IColumnDef>
-  Pks: IIndexKey[]
-  Fks: IForeignKey[]
+  PrimaryKeys: IIndexKey[]
+  ForeignKeys: IForeignKey[]
+  CheckConstraints: ICheckConstraints[]
   Indexes: ICreateIndex[]
-  Parent: string
+  ParentTable: IInterleavedParent
   Comment: string
   Id: string
 }
 
 export interface ICreateIndex {
   Name: string
-  Table: string
+  TableId: string
   Unique: boolean
   Keys: IIndexKey[]
   Id: string
@@ -118,20 +128,29 @@ export interface ICreateIndex {
 
 export interface IForeignKey {
   Name: string
-  Columns: string[]
-  ReferTable: string
-  ReferColumns: string[]
+  ColIds: string[]
+  ReferTableId: string
+  ReferColumnIds: string[]
+  OnDelete: string
+  OnUpdate: string
+  Id: string|undefined
+}
+
+export interface ICheckConstraints {
   Id: string
+  Name: string
+  Expr: string
+  ExprId: string
 }
 
 export interface IIndexKey {
-  Col: string
+  ColId: string
   Desc: boolean
   Order: number
 }
 
 export interface ISrcIndexKey {
-  Column: string
+  ColId: string
   Desc: boolean
   Order: number
 }
@@ -142,6 +161,8 @@ export interface IColumnDef {
   T: IType
   NotNull: boolean
   Comment: string
+  AutoGen: IAutoGen
+  DefaultValue: IDefaultValue
 }
 
 export interface IType {
@@ -151,7 +172,7 @@ export interface IType {
 }
 
 export interface ISyntheticPKey {
-  Col: string
+  ColId: string
   Sequence: Number
 }
 export interface ITableInterleaveStatus {
@@ -166,14 +187,12 @@ export interface IInterleaveStatus {
 
 export interface IPrimaryKey {
   TableId: string
-  Columns: IPkColumnDefs[]
+  Columns: IIndexKey[]
 }
 
-export interface IPkColumnDefs {
-  ColumnId: string
-  ColName: string
-  Desc: boolean
-  Order: number
+export interface IAutoGen {
+  Name: string
+  GenerationType: string
 }
 
 export interface ISessionSummary {
@@ -189,9 +208,21 @@ export interface ISessionSummary {
   NodeCount: number
   ProcessingUnits: number
   Instance: string
+  Dialect: string
+  IsSharded: boolean
 }
 
 export interface ISpannerDetails {
   Region: string
   Instance: string
+  Dialect: string
+}
+
+export interface ITableIdAndName {
+  Id: string
+  Name: string
+}
+
+export interface IShardIdPrimaryKey {
+  AddedAtTheStart: boolean
 }

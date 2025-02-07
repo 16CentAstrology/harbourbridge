@@ -17,10 +17,11 @@ package profiles
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
 	"golang.org/x/net/context"
 	adminpb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 )
@@ -53,33 +54,8 @@ type TargetProfileConnection struct {
 }
 
 type TargetProfile struct {
-	TargetDb string
-	Ty       TargetProfileType
-	Conn     TargetProfileConnection
-}
-
-// ToLegacyTargetDb converts source-profile to equivalent legacy global flag
-// -target-db etc since the rest of the codebase still uses the same.
-// TODO: Deprecate this function and pass around TargetProfile across the
-// codebase wherever information about target connection is required.
-func (trg TargetProfile) ToLegacyTargetDb() string {
-	switch trg.Ty {
-	case TargetProfileTypeConnection:
-		{
-			conn := trg.Conn
-			switch conn.Ty {
-			case TargetProfileConnectionTypeSpanner:
-				{
-					sp := conn.Sp
-					return utils.DialectToTarget(sp.Dialect)
-				}
-			default:
-				return constants.TargetSpanner
-			}
-		}
-	default:
-		return constants.TargetSpanner
-	}
+	Ty   TargetProfileType
+	Conn TargetProfileConnection
 }
 
 // This expects that GetResourceIds has already been called once and the project, instance and dbName
@@ -89,19 +65,19 @@ func (trg TargetProfile) FetchTargetDialect(ctx context.Context) (string, error)
 	// Ideally we should use the client we create at the beginning, but we can fix that with the refactoring.
 	adminClient, _ := utils.NewDatabaseAdminClient(ctx)
 	// The parameters are irrelevant because the results are already cached when called the first time.
-	project, instance, dbName, _ := trg.GetResourceIds(ctx, time.Now(), "", nil)
+	project, instance, dbName, _ := trg.GetResourceIds(ctx, time.Now(), "", nil, &utils.GetUtilInfoImpl{})
 	result, err := adminClient.GetDatabase(ctx, &adminpb.GetDatabaseRequest{Name: fmt.Sprintf("projects/%s/instances/%s/databases/%s", project, instance, dbName)})
 	if err != nil {
 		return "", fmt.Errorf("cannot connect to target: %v", err)
 	}
-	return result.DatabaseDialect.String(), nil
+	return strings.ToLower(result.DatabaseDialect.String()), nil
 }
 
-func (targetProfile *TargetProfile) GetResourceIds(ctx context.Context, now time.Time, driverName string, out *os.File) (string, string, string, error) {
+func (targetProfile *TargetProfile) GetResourceIds(ctx context.Context, now time.Time, driverName string, out *os.File, g utils.GetUtilInfoInterface) (string, string, string, error) {
 	var err error
 	project := targetProfile.Conn.Sp.Project
 	if project == "" {
-		project, err = utils.GetProject()
+		project, err = g.GetProject()
 		if err != nil {
 			return "", "", "", fmt.Errorf("can't get project: %v", err)
 		}
@@ -110,7 +86,8 @@ func (targetProfile *TargetProfile) GetResourceIds(ctx context.Context, now time
 
 	instance := targetProfile.Conn.Sp.Instance
 	if instance == "" {
-		instance, err = utils.GetInstance(ctx, project, out)
+		g := utils.GetUtilInfoImpl{}
+		instance, err = g.GetInstance(ctx, project, out)
 		if err != nil {
 			return "", "", "", fmt.Errorf("can't get instance: %v", err)
 		}
@@ -119,7 +96,8 @@ func (targetProfile *TargetProfile) GetResourceIds(ctx context.Context, now time
 
 	dbName := targetProfile.Conn.Sp.Dbname
 	if dbName == "" {
-		dbName, err = utils.GetDatabaseName(driverName, now)
+		g := utils.GetUtilInfoImpl{}
+		dbName, err = g.GetDatabaseName(driverName, now)
 		if err != nil {
 			return "", "", "", fmt.Errorf("can't get database name: %v", err)
 		}
@@ -141,7 +119,7 @@ func (targetProfile *TargetProfile) GetResourceIds(ctx context.Context, now time
 // correspond to regular Cloud Spanner database and PG Cloud Spanner database
 // respectively.
 //
-// If dbName is not specified, then HarbourBridge will autogenerate the same
+// If dbName is not specified, then Spanner migration tool will autogenerate the same
 // and create a database with the same name.
 //
 // Example: -target-profile="instance=my-instance1,dbName=my-new-db1"
@@ -166,7 +144,17 @@ func NewTargetProfile(s string) (TargetProfile, error) {
 		sp.Dbname = dbName
 	}
 	if dialect, ok := params["dialect"]; ok {
-		sp.Dialect = dialect
+		sp.Dialect = strings.ToLower(dialect)
+	}
+	if sp.Dialect == "" {
+		sp.Dialect = constants.DIALECT_GOOGLESQL
+	} else if sp.Dialect != constants.DIALECT_POSTGRESQL && sp.Dialect != constants.DIALECT_GOOGLESQL {
+		return TargetProfile{}, fmt.Errorf("dialect not supported %v", sp.Dialect)
+	}
+
+	// if target-profile is not empty, it must contain spanner instance
+	if s != "" && sp.Instance == "" {
+		return TargetProfile{}, fmt.Errorf("found empty string for instance. please specify instance (spanner instance) in the target-profile")
 	}
 
 	conn := TargetProfileConnection{Ty: TargetProfileConnectionTypeSpanner, Sp: sp}

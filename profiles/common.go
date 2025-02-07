@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
 	go_ora "github.com/sijms/go-ora/v2"
 )
 
@@ -61,6 +61,23 @@ func ParseMap(s string) (map[string]string, error) {
 	return params, nil
 }
 
+func ParseList(s string)([]string, error) {
+	if (len(s) == 0) {
+		return nil, nil
+	}
+	r := csv.NewReader(strings.NewReader(s))
+	r.Comma = ','
+	r.TrimLeadingSpace = true
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(records) > 1 {
+		return nil, fmt.Errorf("contains invalid newline characters")
+	}
+	return records[0], nil
+}
+
 func GetSQLConnectionStr(sourceProfile SourceProfile) string {
 	sqlConnectionStr := ""
 	if sourceProfile.Ty == SourceProfileTypeConnection {
@@ -98,7 +115,8 @@ func GeneratePGSQLConnectionStr() (string, error) {
 	}
 	password := os.Getenv("PGPASSWORD")
 	if password == "" {
-		password = utils.GetPassword()
+		getInfo := utils.GetUtilInfoImpl{}
+		password = getInfo.GetPassword()
 	}
 	return getPGSQLConnectionStr(server, port, user, password, dbName), nil
 }
@@ -118,7 +136,8 @@ func GenerateMYSQLConnectionStr() (string, error) {
 	}
 	password := os.Getenv("MYSQLPWD")
 	if password == "" {
-		password = utils.GetPassword()
+		getInfo := utils.GetUtilInfoImpl{}
+		password = getInfo.GetPassword()
 	}
 	return getMYSQLConnectionStr(server, port, user, password, dbName), nil
 }

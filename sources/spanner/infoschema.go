@@ -26,18 +26,18 @@ import (
 	_ "github.com/lib/pq" // we will use database/sql package instead of using this package directly
 	"google.golang.org/api/iterator"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 // InfoSchemaImpl postgres specific implementation for InfoSchema.
 type InfoSchemaImpl struct {
-	Client   *spanner.Client
-	Ctx      context.Context
-	TargetDb string
+	Client    *spanner.Client
+	Ctx       context.Context
+	SpDialect string
 }
 
 // GetToDdl function below implement the common.InfoSchema interface.
@@ -46,7 +46,7 @@ func (isi InfoSchemaImpl) GetToDdl() common.ToDdl {
 }
 
 // We leave the 5 functions below empty to be able to pass this as an infoSchema interface. We don't need these for now.
-func (isi InfoSchemaImpl) ProcessData(conv *internal.Conv, srcTable string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable) error {
+func (isi InfoSchemaImpl) ProcessData(conv *internal.Conv, tableId string, srcSchema schema.Table, spCols []string, spSchema ddl.CreateTable, additionalAttributes internal.AdditionalDataAttributes) error {
 	return nil
 }
 
@@ -79,13 +79,13 @@ func (isi InfoSchemaImpl) StartChangeDataCapture(ctx context.Context, conv *inte
 	return nil, nil
 }
 
-func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, client *spanner.Client, conv *internal.Conv, streamingInfo map[string]interface{}) error {
-	return nil
+func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, migrationProjectId string, client *spanner.Client, conv *internal.Conv, streamingInfo map[string]interface{}) (internal.DataflowOutput, error) {
+	return internal.DataflowOutput{}, nil
 }
 
 // GetTableName returns table name.
 func (isi InfoSchemaImpl) GetTableName(schema string, tableName string) string {
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
 		if schema == "public" { // Drop public prefix for pg spanner.
 			return tableName
 		}
@@ -101,7 +101,7 @@ func (isi InfoSchemaImpl) GetTableName(schema string, tableName string) string {
 func (isi InfoSchemaImpl) GetTables() ([]common.SchemaAndName, error) {
 	q := `SELECT table_schema, table_name FROM information_schema.tables 
 	WHERE table_type = 'BASE TABLE' AND table_schema = ''`
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
 		q = `SELECT table_schema, table_name FROM information_schema.tables 
 	WHERE table_type = 'BASE TABLE' AND table_schema = 'public'`
 	}
@@ -134,7 +134,7 @@ func (isi InfoSchemaImpl) GetColumns(conv *internal.Conv, table common.SchemaAnd
 			FROM information_schema.columns
 			WHERE table_schema = '' AND table_name = @p1
 			ORDER BY ordinal_position;`
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
 		q = `SELECT column_name, spanner_type, is_nullable 
 			FROM information_schema.columns
 			WHERE table_schema = 'public' AND table_name = $1
@@ -150,7 +150,7 @@ func (isi InfoSchemaImpl) GetColumns(conv *internal.Conv, table common.SchemaAnd
 	defer iter.Stop()
 
 	colDefs := make(map[string]schema.Column)
-	var colNames []string
+	var colIds []string
 	var colName, spannerType, isNullable string
 	for {
 		row, err := iter.Next()
@@ -173,28 +173,30 @@ func (isi InfoSchemaImpl) GetColumns(conv *internal.Conv, table common.SchemaAnd
 				// Nothing to do here -- these are handled elsewhere.
 			}
 		}
+		colId := internal.GenerateColumnId()
 		c := schema.Column{
+			Id:      colId,
 			Name:    colName,
 			Type:    toType(spannerType),
 			NotNull: common.ToNotNull(conv, isNullable),
 		}
-		colDefs[colName] = c
-		colNames = append(colNames, colName)
+		colDefs[colId] = c
+		colIds = append(colIds, colId)
 	}
-	return colDefs, colNames, nil
+	return colDefs, colIds, nil
 }
 
 // GetConstraints returns a list of primary keys and by-column map of
 // other constraints.  Note: we need to preserve ordinal order of
 // columns in primary key constraints.
 // Note that foreign key constraints are handled in getForeignKeys.
-func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.SchemaAndName) ([]string, map[string][]string, error) {
+func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.SchemaAndName) ([]string, []schema.CheckConstraint, map[string][]string, error) {
 	q := `SELECT k.column_name, t.constraint_type
               FROM information_schema.table_constraints AS t
                 INNER JOIN information_schema.KEY_COLUMN_USAGE AS k
                   ON t.constraint_name = k.constraint_name AND t.constraint_schema = k.constraint_schema
               WHERE k.table_schema = '' AND k.table_name = @p1 ORDER BY k.ordinal_position;`
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
 		q = `SELECT k.column_name, t.constraint_type
 		FROM information_schema.table_constraints AS t
 		  INNER JOIN information_schema.KEY_COLUMN_USAGE AS k
@@ -219,11 +221,11 @@ func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.Schem
 			break
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("couldn't get row while reading constraints: %w", err)
+			return nil, nil, nil, fmt.Errorf("couldn't get row while reading constraints: %w", err)
 		}
 		err = row.Columns(&col, &constraint)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if col == "" || constraint == "" {
 			conv.Unexpected("Got empty col or constraint")
@@ -236,7 +238,7 @@ func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.Schem
 			m[col] = append(m[col], constraint)
 		}
 	}
-	return primaryKeys, m, nil
+	return primaryKeys, nil, m, nil
 }
 
 // GetForeignKeys returns a list of all the foreign key constraints.
@@ -247,7 +249,7 @@ func (isi InfoSchemaImpl) GetForeignKeys(conv *internal.Conv, table common.Schem
 			JOIN information_schema.table_constraints AS t ON k.constraint_name = t.constraint_name 
 			WHERE t.constraint_type='FOREIGN KEY' AND t.table_schema = '' AND t.table_name = @p1
 			ORDER BY k.constraint_name, k.ordinal_position;`
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
 		q = `SELECT  k.constraint_name, k.column_name, c.table_name, c.column_name 
 				FROM information_schema.key_column_usage AS k 
 				JOIN information_schema.constraint_column_usage AS c ON k.constraint_name = c.constraint_name
@@ -302,22 +304,23 @@ func (isi InfoSchemaImpl) GetForeignKeys(conv *internal.Conv, table common.Schem
 		}
 		foreignKeys = append(foreignKeys,
 			schema.ForeignKey{
-				Name:         fKeys[k].Name,
-				Columns:      cols,
-				ReferTable:   fKeys[k].Table,
-				ReferColumns: refcols})
+				Id:               internal.GenerateForeignkeyId(),
+				Name:             fKeys[k].Name,
+				ColumnNames:      cols,
+				ReferTableName:   fKeys[k].Table,
+				ReferColumnNames: refcols})
 	}
 	return foreignKeys, nil
 }
 
 // GetIndexes returns a list of Indexes per table.
-func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAndName) ([]schema.Index, error) {
+func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAndName, colNameIdMap map[string]string) ([]schema.Index, error) {
 	q := `SELECT distinct c.INDEX_NAME,c.COLUMN_NAME,c.ORDINAL_POSITION,c.COLUMN_ORDERING,i.IS_UNIQUE
 			FROM information_schema.index_columns AS c
 			JOIN information_schema.indexes AS i
 			ON c.INDEX_NAME=i.INDEX_NAME
 			WHERE c.table_schema = '' AND i.INDEX_TYPE='INDEX' AND c.TABLE_NAME = @p1 ORDER BY c.INDEX_NAME, c.ORDINAL_POSITION;`
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
 		q = `SELECT distinct c.INDEX_NAME,c.COLUMN_NAME,c.ORDINAL_POSITION,c.COLUMN_ORDERING,i.IS_UNIQUE
 		FROM information_schema.index_columns AS c
 		JOIN information_schema.indexes AS i
@@ -334,6 +337,7 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 	defer iter.Stop()
 	var name, column, ordering string
 	var isUnique bool
+	var isPgUnique string
 	var sequence int64
 	indexMap := make(map[string]schema.Index)
 	var indexNames []string
@@ -346,18 +350,35 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 		if err != nil {
 			return nil, fmt.Errorf("couldn't read row while fetching interleaved tables: %w", err)
 		}
-		err = row.Columns(&name, &column, &sequence, &ordering, &isUnique)
-		if err != nil {
-			fmt.Println(err)
-			conv.Unexpected(fmt.Sprintf("Can't scan: %v", err))
-			continue
+		if isi.SpDialect == constants.DIALECT_POSTGRESQL {
+			err = row.Columns(&name, &column, &sequence, &ordering, &isPgUnique)
+			if err != nil {
+				fmt.Println(err)
+				conv.Unexpected(fmt.Sprintf("Can't scan: %v", err))
+				continue
+			}
+		} else {
+			err = row.Columns(&name, &column, &sequence, &ordering, &isUnique)
+			if err != nil {
+				fmt.Println(err)
+				conv.Unexpected(fmt.Sprintf("Can't scan: %v", err))
+				continue
+			}
 		}
+
+		isUnique = isPgUnique == "YES"
 		if _, found := indexMap[name]; !found {
 			indexNames = append(indexNames, name)
-			indexMap[name] = schema.Index{Name: name, Unique: isUnique}
+			indexMap[name] = schema.Index{
+				Id:     internal.GenerateIndexesId(),
+				Name:   name,
+				Unique: isUnique}
 		}
+
 		index := indexMap[name]
-		index.Keys = append(index.Keys, schema.Key{Column: column, Desc: (ordering == "DESC")})
+		index.Keys = append(index.Keys, schema.Key{
+			ColId: colNameIdMap[column],
+			Desc:  (ordering == "DESC")})
 		indexMap[name] = index
 	}
 	for _, k := range indexNames {
@@ -366,19 +387,19 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 	return indexes, nil
 }
 
-func (isi InfoSchemaImpl) GetInterleaveTables() (map[string]string, error) {
-	q := `SELECT table_name, parent_table_name FROM information_schema.tables 
+func (isi InfoSchemaImpl) GetInterleaveTables(spSchema ddl.Schema) (map[string]ddl.InterleavedParent, error) {
+	q := `SELECT table_name, parent_table_name, on_delete_action FROM information_schema.tables 
 	WHERE interleave_type = 'IN PARENT' AND table_type = 'BASE TABLE' AND table_schema = ''`
-	if isi.TargetDb == constants.TargetExperimentalPostgres {
-		q = `SELECT table_name, parent_table_name FROM information_schema.tables 
+	if isi.SpDialect == constants.DIALECT_POSTGRESQL {
+		q = `SELECT table_name, parent_table_name, on_delete_action FROM information_schema.tables 
 		WHERE interleave_type = 'IN PARENT' AND table_type = 'BASE TABLE' AND table_schema = 'public'`
 	}
 	stmt := spanner.Statement{SQL: q}
 	iter := isi.Client.Single().Query(isi.Ctx, stmt)
 	defer iter.Stop()
 
-	var tableName, parentTable string
-	parentTables := map[string]string{}
+	var tableName, parentTableName, onDelete string
+	parentTables := map[string]ddl.InterleavedParent{}
 	for {
 		row, err := iter.Next()
 		if err == iterator.Done {
@@ -387,11 +408,12 @@ func (isi InfoSchemaImpl) GetInterleaveTables() (map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("couldn't read row while fetching interleaved tables: %w", err)
 		}
-		err = row.Columns(&tableName, &parentTable)
+		err = row.Columns(&tableName, &parentTableName, &onDelete)
 		if err != nil {
 			return nil, err
 		}
-		parentTables[tableName] = parentTable
+		parentTableId, _ := internal.GetTableIdFromSpName(spSchema, parentTableName)
+		parentTables[tableName] = ddl.InterleavedParent{Id: parentTableId, OnDelete: onDelete}
 	}
 	return parentTables, nil
 }

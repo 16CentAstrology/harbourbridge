@@ -8,6 +8,8 @@ import { AppRoutingModule } from './app-routing.module'
 import { HttpClientModule, HTTP_INTERCEPTORS } from '@angular/common/http'
 import { FormsModule } from '@angular/forms'
 import { MatProgressSpinnerModule } from '@angular/material/progress-spinner'
+import { MatChipsModule } from '@angular/material/chips'
+import { MatTooltipModule } from '@angular/material/tooltip';
 
 import { AppComponent } from './app.component'
 import { HeaderComponent } from './components/header/header.component'
@@ -33,15 +35,27 @@ import { AddIndexFormComponent } from './components/add-index-form/add-index-for
 import { EditGlobalDatatypeFormComponent } from './components/edit-global-datatype-form/edit-global-datatype-form.component'
 import { SidenavViewAssessmentComponent } from './components/sidenav-view-assessment/sidenav-view-assessment.component'
 import { SidenavSaveSessionComponent } from './components/sidenav-save-session/sidenav-save-session.component'
-import { DropIndexOrTableDialogComponent } from './components/drop-index-or-table-dialog/drop-index-or-table-dialog.component'
+import { DropObjectDetailDialogComponent } from './components/drop-object-detail-dialog/drop-object-detail-dialog.component'
 import { DatabaseLoaderComponent } from './components/database-loader/database-loader.component'
 import { PrepareMigrationComponent } from './components/prepare-migration/prepare-migration.component'
 import { TargetDetailsFormComponent } from './components/target-details-form/target-details-form.component'
+import { GcsMetadataDetailsFormComponent } from './components/gcs-metadata-details-form/gcs-metadata-details-form.component'
 import { ConnectionProfileFormComponent } from './components/connection-profile-form/connection-profile-form.component'
 import { SourceDetailsFormComponent } from './components/source-details-form/source-details-form.component'
 import { SidenavReviewChangesComponent } from './components/sidenav-review-changes/sidenav-review-changes.component'
 import { TableColumnChangesPreviewComponent } from './components/table-column-changes-preview/table-column-changes-preview.component'
 import { EndMigrationComponent } from './components/end-migration/end-migration.component'
+import { DataflowFormComponent } from './components/dataflow-form/dataflow-form.component';
+import { EditColumnMaxLengthComponent } from './components/edit-column-max-length/edit-column-max-length.component';
+import { ShardedBulkSourceDetailsFormComponent } from './components/sharded-bulk-source-details-form/sharded-bulk-source-details-form.component';
+import { ShardedDataflowMigrationDetailsFormComponent } from './components/sharded-dataflow-migration-details-form/sharded-dataflow-migration-details-form.component';
+import { BulkDropRestoreTableDialogComponent } from './components/bulk-drop-restore-table-dialog/bulk-drop-restore-table-dialog.component'
+import { AddNewColumnComponent } from './components/add-new-column/add-new-column.component';
+import { AddShardIdPrimaryKeyComponent } from './components/add-shard-id-primary-key/add-shard-id-primary-key.component';
+import { EquivalentGcloudCommandComponent } from './components/equivalent-gcloud-command/equivalent-gcloud-command.component';
+import { TuneDatastreamFormComponent } from './components/tune-datastream-form/tune-datastream-form.component';
+import { TuneGcsFormComponent } from './components/tune-gcs-form/tune-gcs-form.component';
+import { AddNewSequenceComponent } from './components/add-new-sequence/add-new-sequence.component'
 
 @NgModule({
   declarations: [
@@ -69,14 +83,26 @@ import { EndMigrationComponent } from './components/end-migration/end-migration.
     SidenavViewAssessmentComponent,
     SidenavSaveSessionComponent,
     DatabaseLoaderComponent,
-    DropIndexOrTableDialogComponent,
+    DropObjectDetailDialogComponent,
     PrepareMigrationComponent,
     TargetDetailsFormComponent,
+    GcsMetadataDetailsFormComponent,
     ConnectionProfileFormComponent,
     SidenavReviewChangesComponent,
     TableColumnChangesPreviewComponent,
     EndMigrationComponent,
     SourceDetailsFormComponent,
+    DataflowFormComponent,
+    EditColumnMaxLengthComponent,
+    ShardedBulkSourceDetailsFormComponent,
+    ShardedDataflowMigrationDetailsFormComponent,
+    BulkDropRestoreTableDialogComponent,
+    AddNewColumnComponent,
+    AddShardIdPrimaryKeyComponent,
+    EquivalentGcloudCommandComponent,
+    TuneDatastreamFormComponent,
+    TuneGcsFormComponent,
+    AddNewSequenceComponent
   ],
   imports: [
     BrowserModule,
@@ -88,6 +114,8 @@ import { EndMigrationComponent } from './components/end-migration/end-migration.
     MatRadioModule,
     ClipboardModule,
     MatProgressSpinnerModule,
+    MatChipsModule,
+    MatTooltipModule,
   ],
   providers: [
     {

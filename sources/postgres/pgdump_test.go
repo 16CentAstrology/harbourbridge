@@ -16,6 +16,7 @@ package postgres
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"math/big"
 	"math/bits"
@@ -25,12 +26,15 @@ import (
 
 	"cloud.google.com/go/spanner"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	pg_query "github.com/pganalyze/pg_query_go/v2"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/expressions_api"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/mocks"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	pg_query "github.com/pganalyze/pg_query_go/v5"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 )
 
 type spannerData struct {
@@ -54,12 +58,12 @@ func TestProcessPgDump(t *testing.T) {
 		{"decimal", ddl.Type{Name: ddl.Numeric}}, // pg parser maps this to numeric.
 		{"double precision", ddl.Type{Name: ddl.Float64}},
 		{"float8", ddl.Type{Name: ddl.Float64}},
-		{"float4", ddl.Type{Name: ddl.Float64}},
+		{"float4", ddl.Type{Name: ddl.Float32}},
 		{"integer", ddl.Type{Name: ddl.Int64}},
 		{"numeric", ddl.Type{Name: ddl.Numeric}},
 		{"numeric(4)", ddl.Type{Name: ddl.Numeric}},
 		{"numeric(6, 4)", ddl.Type{Name: ddl.Numeric}},
-		{"real", ddl.Type{Name: ddl.Float64}},
+		{"real", ddl.Type{Name: ddl.Float32}},
 		{"smallint", ddl.Type{Name: ddl.Int64}},
 		{"text", ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 		{"timestamp", ddl.Type{Name: ddl.Timestamp}},
@@ -76,7 +80,11 @@ func TestProcessPgDump(t *testing.T) {
 	for _, tc := range scalarTests {
 		conv, _ := runProcessPgDump(fmt.Sprintf("CREATE TABLE t (a %s);", tc.ty))
 		noIssues(conv, t, "Scalar type: "+tc.ty)
-		assert.Equal(t, conv.SpSchema["t"].ColDefs["a"].T, tc.expected, "Scalar type: "+tc.ty)
+		tableId, err := internal.GetTableIdFromSpName(conv.SpSchema, "t")
+		assert.Equal(t, nil, err)
+		colId, err := internal.GetColIdFromSpName(conv.SpSchema[tableId].ColDefs, "a")
+		assert.Equal(t, nil, err)
+		assert.Equal(t, tc.expected, conv.SpSchema[tableId].ColDefs[colId].T, "Scalar type: "+tc.ty)
 	}
 	// Next test array types and not null.
 	singleColTests := []struct {
@@ -85,16 +93,21 @@ func TestProcessPgDump(t *testing.T) {
 	}{
 		{"text", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}}},
 		{"text NOT NULL", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true}},
-		{"text array[4]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: true}}},
-		{"text[4]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: true}}},
-		{"text[]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: true}}},
+		{"text array[4]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: false}}},
+		{"text[4]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: false}}},
+		{"text[]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: false}}},
 		{"text[][]", ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}}}, // Unrecognized array type mapped to string.
 	}
 	for _, tc := range singleColTests {
 		conv, _ := runProcessPgDump(fmt.Sprintf("CREATE TABLE t (a %s);", tc.ty))
 		noIssues(conv, t, "Not null: "+tc.ty)
-		cd := conv.SpSchema["t"].ColDefs["a"]
+		tableId, err := internal.GetTableIdFromSpName(conv.SpSchema, "t")
+		assert.Equal(t, nil, err)
+		colId, err := internal.GetColIdFromSpName(conv.SpSchema[tableId].ColDefs, "a")
+		assert.Equal(t, nil, err)
+		cd := conv.SpSchema[tableId].ColDefs[colId]
 		cd.Comment = ""
+		cd.Id = ""
 		assert.Equal(t, tc.expected, cd, "Not null: "+tc.ty)
 	}
 	// Next test more general cases: multi-column schemas and data conversion.
@@ -111,56 +124,56 @@ func TestProcessPgDump(t *testing.T) {
 				"ALTER TABLE ONLY cart ADD CONSTRAINT cart_pkey PRIMARY KEY (productid, userid);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"cart": ddl.CreateTable{
-					Name:     "cart",
-					ColNames: []string{"productid", "userid", "quantity"},
+					Name:   "cart",
+					ColIds: []string{"productid", "userid", "quantity"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"productid": ddl.ColumnDef{Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"userid":    ddl.ColumnDef{Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"quantity":  ddl.ColumnDef{Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "productid"}, ddl.IndexKey{Col: "userid"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "productid", Order: 1}, ddl.IndexKey{ColId: "userid", Order: 2}}}},
 		},
 		{
 			name:  "Shopping cart with no primary key",
 			input: "CREATE TABLE cart (productid text, userid text NOT NULL, quantity bigint);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"cart": ddl.CreateTable{
-					Name:     "cart",
-					ColNames: []string{"productid", "userid", "quantity", "synth_id"},
+					Name:   "cart",
+					ColIds: []string{"productid", "userid", "quantity", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"productid": ddl.ColumnDef{Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"userid":    ddl.ColumnDef{Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"quantity":  ddl.ColumnDef{Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id":  ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}}}},
 		},
 		{
 			name:  "Create table with single primary key",
 			input: "CREATE TABLE test (a text PRIMARY KEY, b text);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
 		},
 		{
 			name:  "Create table with multiple primary keys",
 			input: "CREATE TABLE test (a text, b text, n bigint, PRIMARY KEY (a, b) );\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "n"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "n"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"n": ddl.ColumnDef{Name: "n", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}, ddl.IndexKey{Col: "b"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}, ddl.IndexKey{ColId: "b", Order: 2}}}},
 		},
 		{
 			name: "Create table with single foreign key",
@@ -168,76 +181,76 @@ func TestProcessPgDump(t *testing.T) {
 				"CREATE TABLE test2 (c bigint, d bigint, CONSTRAINT fk_test FOREIGN KEY(d) REFERENCES test(a));\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d", "synth_id"},
+					Name:   "test2",
+					ColIds: []string{"c", "d", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
 						"d":        ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"d"}, ReferTable: "test", ReferColumns: []string{"a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"d"}, ReferTableId: "test", ReferColumnIds: []string{"a"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION}},
 				}},
 		},
 		{
 			name: "Alter table with single foreign key",
 			input: "CREATE TABLE test (a bigint PRIMARY KEY, b text );\n" +
 				"CREATE TABLE test2 (c bigint, d bigint);\n" +
-				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (d) REFERENCES test(a) ON UPDATE CASCADE ON DELETE RESTRICT;\n",
+				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (d) REFERENCES test(a) ON DELETE CASCADE ON UPDATE RESTRICT;\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d", "synth_id"},
+					Name:   "test2",
+					ColIds: []string{"c", "d", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
 						"d":        ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"d"}, ReferTable: "test", ReferColumns: []string{"a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"d"}, ReferTableId: "test", ReferColumnIds: []string{"a"}, OnDelete: constants.FK_CASCADE, OnUpdate: constants.FK_NO_ACTION}},
 				}},
 		},
 		{
 			name: "Alter table with single foreign key multiple column",
 			input: "CREATE TABLE test (a bigint PRIMARY KEY, b bigint, c text );\n" +
 				"CREATE TABLE test2 (c bigint, d bigint);\n" +
-				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (c,d) REFERENCES test(a,b) ON UPDATE CASCADE ON DELETE RESTRICT;\n",
+				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (c,d) REFERENCES test(a,b) ON DELETE SET NULL ON UPDATE NO ACTION;\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.Int64}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d", "synth_id"},
+					Name:   "test2",
+					ColIds: []string{"c", "d", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
 						"d":        ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"c", "d"}, ReferTable: "test", ReferColumns: []string{"a", "b"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"c", "d"}, ReferTableId: "test", ReferColumnIds: []string{"a", "b"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION}},
 				}},
 		},
 		{
@@ -245,37 +258,37 @@ func TestProcessPgDump(t *testing.T) {
 			input: "CREATE TABLE test (a bigint PRIMARY KEY, b text );\n" +
 				"CREATE TABLE test2 (c bigint PRIMARY KEY, d text );\n" +
 				"CREATE TABLE test3 (e bigint, f bigint, g text );\n" +
-				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test FOREIGN KEY (e) REFERENCES test (a);\n" +
-				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test2 FOREIGN KEY (f) REFERENCES test2 (c);",
+				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test FOREIGN KEY (e) REFERENCES test (a) ON DELETE SET DEFAULT;\n" +
+				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test2 FOREIGN KEY (f) REFERENCES test2 (c) ON UPDATE CASCADE;",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d"},
+					Name:   "test2",
+					ColIds: []string{"c", "d"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"d": ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "c"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c", Order: 1}}},
 				"test3": ddl.CreateTable{
-					Name:     "test3",
-					ColNames: []string{"e", "f", "g", "synth_id"},
+					Name:   "test3",
+					ColIds: []string{"e", "f", "g", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"e":        ddl.ColumnDef{Name: "e", T: ddl.Type{Name: ddl.Int64}},
 						"f":        ddl.ColumnDef{Name: "f", T: ddl.Type{Name: ddl.Int64}},
 						"g":        ddl.ColumnDef{Name: "g", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"e"}, ReferTable: "test", ReferColumns: []string{"a"}},
-						ddl.Foreignkey{Name: "fk_test2", Columns: []string{"f"}, ReferTable: "test2", ReferColumns: []string{"c"}}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"e"}, ReferTableId: "test", ReferColumnIds: []string{"a"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION},
+						ddl.Foreignkey{Name: "fk_test2", ColIds: []string{"f"}, ReferTableId: "test2", ReferColumnIds: []string{"c"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION}}}},
 		},
 		{
 			name: "Create index statement",
@@ -287,16 +300,16 @@ func TestProcessPgDump(t *testing.T) {
 				"CREATE INDEX custom_index ON test (b, c);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c", "synth_id"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a":        ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b":        ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Indexes: []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", Table: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "b", Desc: false}, ddl.IndexKey{Col: "c", Desc: false}}}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					Indexes:     []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", TableId: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Desc: false, Order: 1}, ddl.IndexKey{ColId: "c", Desc: false, Order: 2}}}}}},
 		},
 		{
 			name: "Create index statement with order",
@@ -308,16 +321,16 @@ func TestProcessPgDump(t *testing.T) {
 				"CREATE INDEX custom_index ON test (b DESC, c ASC);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c", "synth_id"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a":        ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b":        ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Indexes: []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", Table: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "b", Desc: true}, ddl.IndexKey{Col: "c", Desc: false}}}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					Indexes:     []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", TableId: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Desc: true, Order: 1}, ddl.IndexKey{ColId: "c", Desc: false, Order: 2}}}}}},
 		},
 		{
 			name: "Create index statement with different sequence order",
@@ -329,15 +342,15 @@ func TestProcessPgDump(t *testing.T) {
 				"CREATE UNIQUE INDEX custom_index ON test (c DESC, b ASC);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "c", Desc: true}, ddl.IndexKey{Col: "b", Desc: false}},
-					Indexes: []ddl.CreateIndex{},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c", Desc: true, Order: 1}, ddl.IndexKey{ColId: "b", Desc: false, Order: 2}},
+					Indexes:     []ddl.CreateIndex{},
 				}},
 		},
 		{
@@ -350,15 +363,15 @@ func TestProcessPgDump(t *testing.T) {
 				");\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "b"}},
-					Indexes: []ddl.CreateIndex{},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Order: 1}},
+					Indexes:     []ddl.CreateIndex{},
 				}},
 		},
 		{
@@ -371,15 +384,15 @@ func TestProcessPgDump(t *testing.T) {
 				"ALTER TABLE test ADD CONSTRAINT custom_index UNIQUE (b,c);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "b"}, ddl.IndexKey{Col: "c"}},
-					Indexes: []ddl.CreateIndex{},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Order: 1}, ddl.IndexKey{ColId: "c", Order: 2}},
+					Indexes:     []ddl.CreateIndex{},
 				}},
 		},
 		{
@@ -387,13 +400,26 @@ func TestProcessPgDump(t *testing.T) {
 			input: "CREATE TABLE myschema.test (a text PRIMARY KEY, b text);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"myschema_test": ddl.CreateTable{
-					Name:     "myschema_test",
-					ColNames: []string{"a", "b"},
+					Name:   "myschema_test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
+		},
+		{
+			name:  "Create table with numeric primary key",
+			input: "CREATE TABLE myschema.numericpk (a numeric PRIMARY KEY, b text);\n",
+			expectedSchema: map[string]ddl.CreateTable{
+				"myschema_numericpk": ddl.CreateTable{
+					Name:   "myschema_numericpk",
+					ColIds: []string{"a", "b"},
+					ColDefs: map[string]ddl.ColumnDef{
+						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Numeric}, NotNull: true},
+						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
+					},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
 		},
 		{
 			name: "ALTER TABLE SET NOT NULL",
@@ -401,13 +427,13 @@ func TestProcessPgDump(t *testing.T) {
 				"ALTER TABLE test ALTER COLUMN b SET NOT NULL;\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
 		},
 		{
 			name: "Multiple statements on one line",
@@ -416,18 +442,18 @@ func TestProcessPgDump(t *testing.T) {
 				"ALTER TABLE ONLY t2 ADD CONSTRAINT t2_pkey PRIMARY KEY (c);",
 			expectedSchema: map[string]ddl.CreateTable{
 				"t1": ddl.CreateTable{
-					Name:     "t1",
-					ColNames: []string{"a", "b"},
+					Name:   "t1",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}}},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"t2": ddl.CreateTable{
-					Name:     "t2",
-					ColNames: []string{"c"},
+					Name:   "t2",
+					ColIds: []string{"c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true}},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "c"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c", Order: 1}}}},
 		},
 		{
 			name: "COPY FROM",
@@ -560,37 +586,37 @@ func TestProcessPgDump(t *testing.T) {
 		{
 			name: "Tables and columns with illegal characters",
 			input: `CREATE TABLE "te.s t" ("a?^" text PRIMARY KEY, "b.b" text, "n*n" bigint);
-                                INSERT INTO "te.s t" ("a?^", "b.b", "n*n") VALUES ('a', 'b', 2);`,
+		                                INSERT INTO "te.s t" ("a?^", "b.b", "n*n") VALUES ('a', 'b', 2);`,
 			expectedData: []spannerData{
 				spannerData{table: "te_s_t", cols: []string{"a__", "b_b", "n_n"}, vals: []interface{}{"a", "b", int64(2)}}},
 			expectedSchema: map[string]ddl.CreateTable{
 				"te_s_t": ddl.CreateTable{
-					Name:     "te_s_t",
-					ColNames: []string{"a__", "b_b", "n_n"},
+					Name:   "te_s_t",
+					ColIds: []string{"a__", "b_b", "n_n"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a__": ddl.ColumnDef{Name: "a__", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b_b": ddl.ColumnDef{Name: "b_b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"n_n": ddl.ColumnDef{Name: "n_n", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a__"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a__", Order: 1}}}},
 		},
 		{
 			name: "Tables and columns with illegal characters: CREATE-ALTER",
 			input: `CREATE TABLE "te.s t" ("a?^" text, "b.b" text, "n*n" bigint);
-				ALTER TABLE ONLY "te.s t" ADD CONSTRAINT test_pkey PRIMARY KEY ("a?^");
-                                INSERT INTO "te.s t" ("a?^", "b.b", "n*n") VALUES ('a', 'b', 2);`,
+						ALTER TABLE ONLY "te.s t" ADD CONSTRAINT test_pkey PRIMARY KEY ("a?^");
+		                                INSERT INTO "te.s t" ("a?^", "b.b", "n*n") VALUES ('a', 'b', 2);`,
 			expectedData: []spannerData{
 				spannerData{table: "te_s_t", cols: []string{"a__", "b_b", "n_n"}, vals: []interface{}{"a", "b", int64(2)}}},
 			expectedSchema: map[string]ddl.CreateTable{
 				"te_s_t": ddl.CreateTable{
-					Name:     "te_s_t",
-					ColNames: []string{"a__", "b_b", "n_n"},
+					Name:   "te_s_t",
+					ColIds: []string{"a__", "b_b", "n_n"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a__": ddl.ColumnDef{Name: "a__", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b_b": ddl.ColumnDef{Name: "b_b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"n_n": ddl.ColumnDef{Name: "n_n", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a__"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a__", Order: 1}}}},
 		},
 		// The "Data conversion: ..." cases check data conversion for each type.
 		{
@@ -613,7 +639,7 @@ COPY test (id, a, b, c) FROM stdin;
 \.
 `,
 			expectedData: []spannerData{
-				spannerData{table: "test", cols: []string{"id", "a", "b", "c"}, vals: []interface{}{int64(1), getDate("2019-10-29"), float64(4.444), float64(5.44444)}}},
+				spannerData{table: "test", cols: []string{"id", "a", "b", "c"}, vals: []interface{}{int64(1), getDate("2019-10-29"), float64(4.444), float32(5.44444)}}},
 		},
 		{
 			name: "Data conversion: int8, int4, int2, numeric",
@@ -640,11 +666,12 @@ COPY test (id, a, b, c, d, e, f, g) FROM stdin;
 	}
 	for _, tc := range multiColTests {
 		conv, rows := runProcessPgDump(tc.input)
+		assert.ElementsMatch(t, [][]string{{"a"}, {"b"}}, [][]string{{"b"}, {"a"}}, "Array good")
 		if !tc.expectIssues {
 			noIssues(conv, t, tc.name)
 		}
 		if tc.expectedSchema != nil {
-			assert.Equal(t, tc.expectedSchema, stripSchemaComments(conv.SpSchema), tc.name+": Schema did not match")
+			internal.AssertSpSchema(conv, t, tc.expectedSchema, stripSchemaComments(conv.SpSchema))
 		}
 		if tc.expectedData != nil {
 			assert.Equal(t, tc.expectedData, rows, tc.name+": Data rows did not match")
@@ -666,30 +693,32 @@ COPY test (id, a, b, c, d, e, f, g) FROM stdin;
 		{
 			// Test bad data for each scalar type (except text, which accepts all values) and an array type.
 			name: "Data conversion errors",
-			input: "CREATE TABLE test (int8 int8, float8 float8, bool bool, timestamp timestamp, date date, bytea bytea, arr integer array);\n" +
-				"COPY public.test (int8, float8, bool, timestamp, date, bytea, arr) FROM stdin;\n" +
-				"7	42.1	true	2019-10-29 05:30:00	2019-10-29	\\\\x0001beef	{42,6}\n" + // Baseline (good)
-				"7	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Good
-				"7-	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Error
-				"\\N	42.1	\\N	\\N	\\N	\\N	\\N\n" + // Good
-				"\\N	4.2.1	\\N	\\N	\\N	\\N	\\N\n" + // Error
-				"\\N	\\N	true	\\N	\\N	\\N	\\N\n" + // Good
-				"\\N	\\N	truefalse	\\N	\\N	\\N	\\N\n" + // Error
-				"\\N	\\N	\\N	2019-10-29 05:30:00	\\N	\\N	\\N\n" + // Good
-				"\\N	\\N	\\N	2019-100-29 05:30:00	\\N	\\N	\\N\n" + // Error
-				"\\N	\\N	\\N	\\N	2019-10-29	\\N	\\N\n" + // Good
-				"\\N	\\N	\\N	\\N	2019-10-42	\\N	\\N\n" + // Error
-				"\\N	\\N	\\N	\\N	\\N	\\\\x0001beef	\\N\n" + // Good
-				"\\N	\\N	\\N	\\N	\\N	\\ \\x0001beef	\\N\n" + // Error
-				"\\N	\\N	\\N	\\N	\\N	\\N	{42,6}\n" + // Good
-				"\\N	\\N	\\N	\\N	\\N	\\N	{42, 6}\n" + // Error
+			input: "CREATE TABLE test (int8 int8, float8 float8, bool bool, timestamp timestamp, date date, bytea bytea, arr integer array, float4 float4);\n" +
+				"COPY public.test (int8, float8, bool, timestamp, date, bytea, arr, float4) FROM stdin;\n" +
+				"7	42.1	true	2019-10-29 05:30:00	2019-10-29	\\\\x0001beef	{42,6}	3.14\n" + // Baseline (good)
+				"7	\\N	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Good
+				"7-	\\N	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	42.1	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Good
+				"\\N	4.2.1	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	true	\\N	\\N	\\N	\\N	\\N\n" + // Good
+				"\\N	\\N	truefalse	\\N	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	2019-10-29 05:30:00	\\N	\\N	\\N	\\N\n" + // Good
+				"\\N	\\N	\\N	2019-100-29 05:30:00	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	\\N	2019-10-29	\\N	\\N	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	2019-10-42	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	\\N	\\N	\\\\x0001beef	\\N	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\ \\x0001beef	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	\\N	\\N	\\N	{42,6}	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\N	{42, 6}	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\N	\\N	3.14\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\N	\\N	3.1.4\n" + // Error
 				"\\.\n",
 			expectedData: []spannerData{
 				spannerData{
-					table: "test", cols: []string{"int8", "float8", "bool", "timestamp", "date", "bytea", "arr", "synth_id"},
+					table: "test", cols: []string{"int8", "float8", "bool", "timestamp", "date", "bytea", "arr", "float4", "synth_id"},
 					vals: []interface{}{int64(7), float64(42.1), true, getTime(t, "2019-10-29T05:30:00Z"),
 						getDate("2019-10-29"), []byte{0x0, 0x1, 0xbe, 0xef},
-						[]spanner.NullInt64{{Int64: 42, Valid: true}, {Int64: 6, Valid: true}},
+						"{42,6}", float32(3.14),
 						fmt.Sprintf("%d", bitReverse(0))}},
 				spannerData{table: "test", cols: []string{"int8", "synth_id"}, vals: []interface{}{int64(7), fmt.Sprintf("%d", bitReverse(1))}},
 				spannerData{table: "test", cols: []string{"float8", "synth_id"}, vals: []interface{}{float64(42.1), fmt.Sprintf("%d", bitReverse(2))}},
@@ -698,7 +727,10 @@ COPY test (id, a, b, c, d, e, f, g) FROM stdin;
 				spannerData{table: "test", cols: []string{"date", "synth_id"}, vals: []interface{}{getDate("2019-10-29"), fmt.Sprintf("%d", bitReverse(5))}},
 				spannerData{table: "test", cols: []string{"bytea", "synth_id"}, vals: []interface{}{[]byte{0x0, 0x1, 0xbe, 0xef}, fmt.Sprintf("%d", bitReverse(6))}},
 				spannerData{table: "test", cols: []string{"arr", "synth_id"},
-					vals: []interface{}{[]spanner.NullInt64{{Int64: 42, Valid: true}, {Int64: 6, Valid: true}}, fmt.Sprintf("%d", bitReverse(7))}},
+					vals: []interface{}{"{42,6}", fmt.Sprintf("%d", bitReverse(7))}},
+				spannerData{table: "test", cols: []string{"arr", "synth_id"},
+					vals: []interface{}{"{42, 6}", fmt.Sprintf("%d", bitReverse(8))}},
+				spannerData{table: "test", cols: []string{"float4", "synth_id"}, vals: []interface{}{float32(3.14), fmt.Sprintf("%d", bitReverse(9))}},
 			},
 		},
 	}
@@ -724,12 +756,12 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 		{"decimal", ddl.Type{Name: ddl.Numeric}}, // pg parser maps this to numeric.
 		{"double precision", ddl.Type{Name: ddl.Float64}},
 		{"float8", ddl.Type{Name: ddl.Float64}},
-		{"float4", ddl.Type{Name: ddl.Float64}},
+		{"float4", ddl.Type{Name: ddl.Float32}},
 		{"integer", ddl.Type{Name: ddl.Int64}},
 		{"numeric", ddl.Type{Name: ddl.Numeric}},
 		{"numeric(4)", ddl.Type{Name: ddl.Numeric}},
 		{"numeric(6, 4)", ddl.Type{Name: ddl.Numeric}},
-		{"real", ddl.Type{Name: ddl.Float64}},
+		{"real", ddl.Type{Name: ddl.Float32}},
 		{"smallint", ddl.Type{Name: ddl.Int64}},
 		{"text", ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 		{"timestamp", ddl.Type{Name: ddl.Timestamp}},
@@ -744,7 +776,9 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 	for _, tc := range scalarTests {
 		conv, _ := runProcessPgDumpPGTarget(fmt.Sprintf("CREATE TABLE t (a %s);", tc.ty))
 		noIssues(conv, t, "Scalar type: "+tc.ty)
-		assert.Equal(t, conv.SpSchema["t"].ColDefs["a"].T, tc.expected, "Scalar type: "+tc.ty)
+		tableId, _ := internal.GetTableIdFromSrcName(conv.SrcSchema, "t")
+		columnId, _ := internal.GetColIdFromSrcName(conv.SrcSchema[tableId].ColDefs, "a")
+		assert.Equal(t, conv.SpSchema[tableId].ColDefs[columnId].T, tc.expected, "Scalar type: "+tc.ty)
 	}
 	// Next test array types and not null. For PG Spanner, all array types mapped to string.
 	singleColTests := []struct {
@@ -761,8 +795,11 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 	for _, tc := range singleColTests {
 		conv, _ := runProcessPgDumpPGTarget(fmt.Sprintf("CREATE TABLE t (a %s);", tc.ty))
 		noIssues(conv, t, "Not null: "+tc.ty)
-		cd := conv.SpSchema["t"].ColDefs["a"]
+		tableId, _ := internal.GetTableIdFromSrcName(conv.SrcSchema, "t")
+		columnId, _ := internal.GetColIdFromSrcName(conv.SrcSchema[tableId].ColDefs, "a")
+		cd := conv.SpSchema[tableId].ColDefs[columnId]
 		cd.Comment = ""
+		cd.Id = ""
 		assert.Equal(t, tc.expected, cd, "Not null: "+tc.ty)
 	}
 	// Next test more general cases: multi-column schemas and data conversion.
@@ -779,56 +816,56 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"ALTER TABLE ONLY cart ADD CONSTRAINT cart_pkey PRIMARY KEY (productid, userid);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"cart": ddl.CreateTable{
-					Name:     "cart",
-					ColNames: []string{"productid", "userid", "quantity"},
+					Name:   "cart",
+					ColIds: []string{"productid", "userid", "quantity"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"productid": ddl.ColumnDef{Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"userid":    ddl.ColumnDef{Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"quantity":  ddl.ColumnDef{Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "productid"}, ddl.IndexKey{Col: "userid"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "productid", Order: 1}, ddl.IndexKey{ColId: "userid", Order: 2}}}},
 		},
 		{
 			name:  "Shopping cart with no primary key",
 			input: "CREATE TABLE cart (productid text, userid text NOT NULL, quantity bigint);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"cart": ddl.CreateTable{
-					Name:     "cart",
-					ColNames: []string{"productid", "userid", "quantity", "synth_id"},
+					Name:   "cart",
+					ColIds: []string{"productid", "userid", "quantity", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"productid": ddl.ColumnDef{Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"userid":    ddl.ColumnDef{Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"quantity":  ddl.ColumnDef{Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id":  ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}}}},
 		},
 		{
 			name:  "Create table with single primary key",
 			input: "CREATE TABLE test (a text PRIMARY KEY, b text);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
 		},
 		{
 			name:  "Create table with multiple primary keys",
 			input: "CREATE TABLE test (a text, b text, n bigint, PRIMARY KEY (a, b) );\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "n"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "n"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"n": ddl.ColumnDef{Name: "n", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}, ddl.IndexKey{Col: "b"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}, ddl.IndexKey{ColId: "b", Order: 2}}}},
 		},
 		{
 			name: "Create table with single foreign key",
@@ -836,76 +873,76 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"CREATE TABLE test2 (c bigint, d bigint, CONSTRAINT fk_test FOREIGN KEY(d) REFERENCES test(a));\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d", "synth_id"},
+					Name:   "test2",
+					ColIds: []string{"c", "d", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
 						"d":        ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"d"}, ReferTable: "test", ReferColumns: []string{"a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"d"}, ReferTableId: "test", ReferColumnIds: []string{"a"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION}},
 				}},
 		},
 		{
 			name: "Alter table with single foreign key",
 			input: "CREATE TABLE test (a bigint PRIMARY KEY, b text );\n" +
 				"CREATE TABLE test2 (c bigint, d bigint);\n" +
-				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (d) REFERENCES test(a) ON UPDATE CASCADE ON DELETE RESTRICT;\n",
+				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (d) REFERENCES test(a) ON DELETE CASCADE ON UPDATE RESTRICT;\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d", "synth_id"},
+					Name:   "test2",
+					ColIds: []string{"c", "d", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
 						"d":        ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"d"}, ReferTable: "test", ReferColumns: []string{"a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"d"}, ReferTableId: "test", ReferColumnIds: []string{"a"}, OnDelete: constants.FK_CASCADE, OnUpdate: constants.FK_NO_ACTION}},
 				}},
 		},
 		{
 			name: "Alter table with single foreign key multiple column",
 			input: "CREATE TABLE test (a bigint PRIMARY KEY, b bigint, c text );\n" +
 				"CREATE TABLE test2 (c bigint, d bigint);\n" +
-				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (c,d) REFERENCES test(a,b) ON UPDATE CASCADE ON DELETE RESTRICT;\n",
+				"ALTER TABLE ONLY test2 ADD CONSTRAINT fk_test FOREIGN KEY (c,d) REFERENCES test(a,b) ON UPDATE SET NULL;\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.Int64}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d", "synth_id"},
+					Name:   "test2",
+					ColIds: []string{"c", "d", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
 						"d":        ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Int64}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"c", "d"}, ReferTable: "test", ReferColumns: []string{"a", "b"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"c", "d"}, ReferTableId: "test", ReferColumnIds: []string{"a", "b"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION}},
 				}},
 		},
 		{
@@ -913,37 +950,37 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 			input: "CREATE TABLE test (a bigint PRIMARY KEY, b text );\n" +
 				"CREATE TABLE test2 (c bigint PRIMARY KEY, d text );\n" +
 				"CREATE TABLE test3 (e bigint, f bigint, g text );\n" +
-				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test FOREIGN KEY (e) REFERENCES test (a);\n" +
+				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test FOREIGN KEY (e) REFERENCES test (a) ON DELETE CASCADE;\n" +
 				"ALTER TABLE ONLY test3 ADD CONSTRAINT fk_test2 FOREIGN KEY (f) REFERENCES test2 (c);",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"test2": ddl.CreateTable{
-					Name:     "test2",
-					ColNames: []string{"c", "d"},
+					Name:   "test2",
+					ColIds: []string{"c", "d"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
 						"d": ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "c"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c", Order: 1}}},
 				"test3": ddl.CreateTable{
-					Name:     "test3",
-					ColNames: []string{"e", "f", "g", "synth_id"},
+					Name:   "test3",
+					ColIds: []string{"e", "f", "g", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"e":        ddl.ColumnDef{Name: "e", T: ddl.Type{Name: ddl.Int64}},
 						"f":        ddl.ColumnDef{Name: "f", T: ddl.Type{Name: ddl.Int64}},
 						"g":        ddl.ColumnDef{Name: "g", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"e"}, ReferTable: "test", ReferColumns: []string{"a"}},
-						ddl.Foreignkey{Name: "fk_test2", Columns: []string{"f"}, ReferTable: "test2", ReferColumns: []string{"c"}}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					ForeignKeys: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", ColIds: []string{"e"}, ReferTableId: "test", ReferColumnIds: []string{"a"}, OnDelete: constants.FK_CASCADE, OnUpdate: constants.FK_NO_ACTION},
+						ddl.Foreignkey{Name: "fk_test2", ColIds: []string{"f"}, ReferTableId: "test2", ReferColumnIds: []string{"c"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION}}}},
 		},
 		{
 			name: "Create index statement",
@@ -955,16 +992,16 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"CREATE INDEX custom_index ON test (b, c);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c", "synth_id"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a":        ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b":        ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Indexes: []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", Table: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "b", Desc: false}, ddl.IndexKey{Col: "c", Desc: false}}}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					Indexes:     []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", TableId: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Desc: false, Order: 1}, ddl.IndexKey{ColId: "c", Desc: false, Order: 2}}}}}},
 		},
 		{
 			name: "Create index statement with order",
@@ -976,16 +1013,16 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"CREATE INDEX custom_index ON test (b DESC, c ASC);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c", "synth_id"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a":        ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b":        ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}},
-					Indexes: []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", Table: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "b", Desc: true}, ddl.IndexKey{Col: "c", Desc: false}}}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "synth_id", Order: 1}},
+					Indexes:     []ddl.CreateIndex{ddl.CreateIndex{Name: "custom_index", TableId: "test", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Desc: true, Order: 1}, ddl.IndexKey{ColId: "c", Desc: false, Order: 2}}}}}},
 		},
 		{
 			name: "Create index statement with different sequence order",
@@ -997,15 +1034,15 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"CREATE UNIQUE INDEX custom_index ON test (c DESC, b ASC);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "c", Desc: true}, ddl.IndexKey{Col: "b", Desc: false}},
-					Indexes: []ddl.CreateIndex{},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c", Desc: true, Order: 1}, ddl.IndexKey{ColId: "b", Desc: false, Order: 2}},
+					Indexes:     []ddl.CreateIndex{},
 				}},
 		},
 		{
@@ -1018,15 +1055,15 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				");\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "b"}},
-					Indexes: []ddl.CreateIndex{},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Order: 1}},
+					Indexes:     []ddl.CreateIndex{},
 				}},
 		},
 		{
@@ -1039,15 +1076,15 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"ALTER TABLE test ADD CONSTRAINT custom_index UNIQUE (b,c);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b", "c"},
+					Name:   "test",
+					ColIds: []string{"a", "b", "c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.Int64}},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks:     []ddl.IndexKey{ddl.IndexKey{Col: "b"}, ddl.IndexKey{Col: "c"}},
-					Indexes: []ddl.CreateIndex{},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "b", Order: 1}, ddl.IndexKey{ColId: "c", Order: 2}},
+					Indexes:     []ddl.CreateIndex{},
 				}},
 		},
 		{
@@ -1055,13 +1092,13 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 			input: "CREATE TABLE myschema.test (a text PRIMARY KEY, b text);\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"myschema_test": ddl.CreateTable{
-					Name:     "myschema_test",
-					ColNames: []string{"a", "b"},
+					Name:   "myschema_test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
 		},
 		{
 			name: "ALTER TABLE SET NOT NULL",
@@ -1069,13 +1106,13 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"ALTER TABLE test ALTER COLUMN b SET NOT NULL;\n",
 			expectedSchema: map[string]ddl.CreateTable{
 				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"a", "b"},
+					Name:   "test",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}}},
 		},
 		{
 			name: "Multiple statements on one line",
@@ -1084,18 +1121,18 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				"ALTER TABLE ONLY t2 ADD CONSTRAINT t2_pkey PRIMARY KEY (c);",
 			expectedSchema: map[string]ddl.CreateTable{
 				"t1": ddl.CreateTable{
-					Name:     "t1",
-					ColNames: []string{"a", "b"},
+					Name:   "t1",
+					ColIds: []string{"a", "b"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a": ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b": ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}}},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a"}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a", Order: 1}}},
 				"t2": ddl.CreateTable{
-					Name:     "t2",
-					ColNames: []string{"c"},
+					Name:   "t2",
+					ColIds: []string{"c"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"c": ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true}},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "c"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "c", Order: 1}}}},
 		},
 		{
 			name: "COPY FROM",
@@ -1233,14 +1270,14 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				spannerData{table: "te_s_t", cols: []string{"a__", "b_b", "n_n"}, vals: []interface{}{"a", "b", int64(2)}}},
 			expectedSchema: map[string]ddl.CreateTable{
 				"te_s_t": ddl.CreateTable{
-					Name:     "te_s_t",
-					ColNames: []string{"a__", "b_b", "n_n"},
+					Name:   "te_s_t",
+					ColIds: []string{"a__", "b_b", "n_n"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a__": ddl.ColumnDef{Name: "a__", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b_b": ddl.ColumnDef{Name: "b_b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"n_n": ddl.ColumnDef{Name: "n_n", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a__"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a__", Order: 1}}}},
 		},
 		{
 			name: "Tables and columns with illegal characters: CREATE-ALTER",
@@ -1251,14 +1288,14 @@ func TestProcessPgDumpPGTarget(t *testing.T) {
 				spannerData{table: "te_s_t", cols: []string{"a__", "b_b", "n_n"}, vals: []interface{}{"a", "b", int64(2)}}},
 			expectedSchema: map[string]ddl.CreateTable{
 				"te_s_t": ddl.CreateTable{
-					Name:     "te_s_t",
-					ColNames: []string{"a__", "b_b", "n_n"},
+					Name:   "te_s_t",
+					ColIds: []string{"a__", "b_b", "n_n"},
 					ColDefs: map[string]ddl.ColumnDef{
 						"a__": ddl.ColumnDef{Name: "a__", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
 						"b_b": ddl.ColumnDef{Name: "b_b", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
 						"n_n": ddl.ColumnDef{Name: "n_n", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "a__"}}}},
+					PrimaryKeys: []ddl.IndexKey{ddl.IndexKey{ColId: "a__", Order: 1}}}},
 		},
 		// The "Data conversion: ..." cases check data conversion for each type.
 		{
@@ -1281,7 +1318,7 @@ COPY test (id, a, b, c) FROM stdin;
 \.
 `,
 			expectedData: []spannerData{
-				spannerData{table: "test", cols: []string{"id", "a", "b", "c"}, vals: []interface{}{int64(1), getDate("2019-10-29"), float64(4.444), float64(5.44444)}}},
+				spannerData{table: "test", cols: []string{"id", "a", "b", "c"}, vals: []interface{}{int64(1), getDate("2019-10-29"), float64(4.444), float32(5.44444)}}},
 		},
 		{
 			name: "Data conversion: int8, int4, int2, numeric",
@@ -1312,7 +1349,7 @@ COPY test (id, a, b, c, d, e) FROM stdin;
 			noIssues(conv, t, tc.name)
 		}
 		if tc.expectedSchema != nil {
-			assert.Equal(t, tc.expectedSchema, stripSchemaComments(conv.SpSchema), tc.name+": Schema did not match")
+			internal.AssertSpSchema(conv, t, tc.expectedSchema, stripSchemaComments(conv.SpSchema))
 		}
 		if tc.expectedData != nil {
 			assert.Equal(t, tc.expectedData, rows, tc.name+": Data rows did not match")
@@ -1334,30 +1371,32 @@ COPY test (id, a, b, c, d, e) FROM stdin;
 		{
 			// Test bad data for each scalar type (except text, which accepts all values) and an array type.
 			name: "Data conversion errors",
-			input: "CREATE TABLE test (int8 int8, float8 float8, bool bool, timestamp timestamp, date date, bytea bytea, arr integer array);\n" +
-				"COPY public.test (int8, float8, bool, timestamp, date, bytea, arr) FROM stdin;\n" +
-				"7	42.1	true	2019-10-29 05:30:00	2019-10-29	\\\\x0001beef	{42,6}\n" + // Baseline (good)
-				"7	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Good
-				"7-	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Error
-				"\\N	42.1	\\N	\\N	\\N	\\N	\\N\n" + // Good
-				"\\N	4.2.1	\\N	\\N	\\N	\\N	\\N\n" + // Error
-				"\\N	\\N	true	\\N	\\N	\\N	\\N\n" + // Good
-				"\\N	\\N	truefalse	\\N	\\N	\\N	\\N\n" + // Error
-				"\\N	\\N	\\N	2019-10-29 05:30:00	\\N	\\N	\\N\n" + // Good
-				"\\N	\\N	\\N	2019-100-29 05:30:00	\\N	\\N	\\N\n" + // Error
-				"\\N	\\N	\\N	\\N	2019-10-29	\\N	\\N\n" + // Good
-				"\\N	\\N	\\N	\\N	2019-10-42	\\N	\\N\n" + // Error
-				"\\N	\\N	\\N	\\N	\\N	\\\\x0001beef	\\N\n" + // Good
-				"\\N	\\N	\\N	\\N	\\N	\\ \\x0001beef	\\N\n" + // Error
-				"\\N	\\N	\\N	\\N	\\N	\\N	{42,6}\n" + // Good
-				"\\N	\\N	\\N	\\N	\\N	\\N	{42, 6}\n" + // Good
+			input: "CREATE TABLE test (int8 int8, float8 float8, bool bool, timestamp timestamp, date date, bytea bytea, arr integer array, float4 float4);\n" +
+				"COPY public.test (int8, float8, bool, timestamp, date, bytea, arr, float4) FROM stdin;\n" +
+				"7	42.1	true	2019-10-29 05:30:00	2019-10-29	\\\\x0001beef	{42,6}	3.14\n" + // Baseline (good)
+				"7	\\N	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Good
+				"7-	\\N	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	42.1	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Good
+				"\\N	4.2.1	\\N	\\N	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	true	\\N	\\N	\\N	\\N	\\N\n" + // Good
+				"\\N	\\N	truefalse	\\N	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	2019-10-29 05:30:00	\\N	\\N	\\N	\\N\n" + // Good
+				"\\N	\\N	\\N	2019-100-29 05:30:00	\\N	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	\\N	2019-10-29	\\N	\\N	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	2019-10-42	\\N	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	\\N	\\N	\\\\x0001beef	\\N	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\ \\x0001beef	\\N	\\N\n" + // Error
+				"\\N	\\N	\\N	\\N	\\N	\\N	{42,6}	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\N	{42, 6}	\\N\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\N	\\N	3.14\n" + // Good
+				"\\N	\\N	\\N	\\N	\\N	\\N	\\N	3.1.4\n" + // Error
 				"\\.\n",
 			expectedData: []spannerData{
 				spannerData{
-					table: "test", cols: []string{"int8", "float8", "bool", "timestamp", "date", "bytea", "arr", "synth_id"},
+					table: "test", cols: []string{"int8", "float8", "bool", "timestamp", "date", "bytea", "arr", "float4", "synth_id"},
 					vals: []interface{}{int64(7), float64(42.1), true, getTime(t, "2019-10-29T05:30:00Z"),
 						getDate("2019-10-29"), []byte{0x0, 0x1, 0xbe, 0xef},
-						"{42,6}",
+						"{42,6}", float32(3.14),
 						fmt.Sprintf("%d", bitReverse(0))}},
 				spannerData{table: "test", cols: []string{"int8", "synth_id"}, vals: []interface{}{int64(7), fmt.Sprintf("%d", bitReverse(1))}},
 				spannerData{table: "test", cols: []string{"float8", "synth_id"}, vals: []interface{}{float64(42.1), fmt.Sprintf("%d", bitReverse(2))}},
@@ -1367,13 +1406,14 @@ COPY test (id, a, b, c, d, e) FROM stdin;
 				spannerData{table: "test", cols: []string{"bytea", "synth_id"}, vals: []interface{}{[]byte{0x0, 0x1, 0xbe, 0xef}, fmt.Sprintf("%d", bitReverse(6))}},
 				spannerData{table: "test", cols: []string{"arr", "synth_id"}, vals: []interface{}{"{42,6}", fmt.Sprintf("%d", bitReverse(7))}},
 				spannerData{table: "test", cols: []string{"arr", "synth_id"}, vals: []interface{}{"{42, 6}", fmt.Sprintf("%d", bitReverse(8))}},
+				spannerData{table: "test", cols: []string{"float4", "synth_id"}, vals: []interface{}{float32(3.14), fmt.Sprintf("%d", bitReverse(9))}},
 			},
 		},
 	}
 	for _, tc := range dataErrorTests {
 		conv, rows := runProcessPgDumpPGTarget(tc.input)
 		assert.Equal(t, tc.expectedData, rows, tc.name+": Data rows did not match")
-		assert.Equal(t, conv.BadRows(), int64(6), tc.name+": Error count did not match")
+		assert.Equal(t, conv.BadRows(), int64(7), tc.name+": Error count did not match")
 	}
 }
 
@@ -1384,12 +1424,12 @@ func TestProcessPgDump_GetDDL(t *testing.T) {
 		"ALTER TABLE ONLY cart ADD CONSTRAINT cart_pkey PRIMARY KEY (productid, userid);")
 	expected :=
 		"CREATE TABLE cart (\n" +
-			"	productid STRING(MAX) NOT NULL,\n" +
-			"	userid STRING(MAX) NOT NULL,\n" +
+			"	productid STRING(MAX) NOT NULL ,\n" +
+			"	userid STRING(MAX) NOT NULL ,\n" +
 			"	quantity INT64,\n" +
 			") PRIMARY KEY (productid, userid)"
 	c := ddl.Config{Tables: true}
-	assert.Equal(t, expected, strings.Join(conv.SpSchema.GetDDL(c), " "))
+	assert.Equal(t, expected, strings.Join(ddl.GetDDL(c, conv.SpSchema, conv.SpSequences), " "))
 }
 
 func TestProcessPgDump_GetPGDDL(t *testing.T) {
@@ -1397,13 +1437,13 @@ func TestProcessPgDump_GetPGDDL(t *testing.T) {
 		"ALTER TABLE ONLY cart ADD CONSTRAINT cart_pkey PRIMARY KEY (productid, userid);")
 	expected :=
 		"CREATE TABLE cart (\n" +
-			"	productid VARCHAR(2621440) NOT NULL,\n" +
-			"	userid VARCHAR(2621440) NOT NULL,\n" +
+			"	productid VARCHAR(2621440) NOT NULL ,\n" +
+			"	userid VARCHAR(2621440) NOT NULL ,\n" +
 			"	quantity INT8,\n" +
 			"	PRIMARY KEY (productid, userid)\n" +
 			")"
-	c := ddl.Config{Tables: true, TargetDb: conv.TargetDb}
-	assert.Equal(t, expected, strings.Join(conv.SpSchema.GetDDL(c), " "))
+	c := ddl.Config{Tables: true, SpDialect: conv.SpDialect}
+	assert.Equal(t, expected, strings.Join(ddl.GetDDL(c, conv.SpSchema, conv.SpSequences), " "))
 }
 
 func TestProcessPgDump_Rows(t *testing.T) {
@@ -1434,38 +1474,38 @@ func TestProcessPgDump_AddPrimaryKeys(t *testing.T) {
 			name:  "Shopping cart",
 			input: "CREATE TABLE cart (productid text, userid text, quantity bigint);",
 			expectedSchema: map[string]ddl.CreateTable{
-				"cart": ddl.CreateTable{
-					Name:     "cart",
-					ColNames: []string{"productid", "userid", "quantity", "synth_id"},
+				"cart": {
+					Name:   "cart",
+					ColIds: []string{"productid", "userid", "quantity", "synth_id"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"productid": ddl.ColumnDef{Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
-						"userid":    ddl.ColumnDef{Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
-						"quantity":  ddl.ColumnDef{Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
-						"synth_id":  ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
+						"productid": {Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
+						"userid":    {Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
+						"quantity":  {Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
+						"synth_id":  {Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}}}},
+					PrimaryKeys: []ddl.IndexKey{{ColId: "synth_id", Order: 1}}}},
 		},
 		{
 			name:  "synth_id clash",
 			input: "CREATE TABLE test (synth_id text, synth_id0 text, synth_id1 bigint);",
 			expectedSchema: map[string]ddl.CreateTable{
-				"test": ddl.CreateTable{
-					Name:     "test",
-					ColNames: []string{"synth_id", "synth_id0", "synth_id1", "synth_id2"},
+				"test": {
+					Name:   "test",
+					ColIds: []string{"synth_id", "synth_id0", "synth_id1", "synth_id2"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"synth_id":  ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
-						"synth_id0": ddl.ColumnDef{Name: "synth_id0", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
-						"synth_id1": ddl.ColumnDef{Name: "synth_id1", T: ddl.Type{Name: ddl.Int64}},
-						"synth_id2": ddl.ColumnDef{Name: "synth_id2", T: ddl.Type{Name: ddl.String, Len: 50}},
+						"synth_id":  {Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
+						"synth_id0": {Name: "synth_id0", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
+						"synth_id1": {Name: "synth_id1", T: ddl.Type{Name: ddl.Int64}},
+						"synth_id2": {Name: "synth_id2", T: ddl.Type{Name: ddl.String, Len: 50}},
 					},
-					Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id2"}}}},
+					PrimaryKeys: []ddl.IndexKey{{ColId: "synth_id2", Order: 1}}}},
 		},
 	}
 	for _, tc := range cases {
 		conv, _ := runProcessPgDump(tc.input)
 		conv.AddPrimaryKeys()
 		if tc.expectedSchema != nil {
-			assert.Equal(t, tc.expectedSchema, stripSchemaComments(conv.SpSchema), tc.name+": Schema did not match")
+			internal.AssertSpSchema(conv, t, tc.expectedSchema, stripSchemaComments(conv.SpSchema))
 		}
 	}
 }
@@ -1475,7 +1515,14 @@ func TestProcessPgDump_WithUnparsableContent(t *testing.T) {
 	conv := internal.MakeConv()
 	conv.SetLocation(time.UTC)
 	conv.SetSchemaMode()
-	err := common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), DbDumpImpl{})
+	mockAccessor := new(mocks.MockExpressionVerificationAccessor)
+	ctx := context.Background()
+	mockAccessor.On("VerifyExpressions", ctx, mock.Anything).Return(internal.VerifyExpressionsOutput{
+		ExpressionVerificationOutputList: []internal.ExpressionVerificationOutput{
+			{Result: true, Err: nil, ExpressionDetail: internal.ExpressionDetail{Expression: "(col1 > 0)", Type: "CHECK", Metadata: map[string]string{"tableId": "t1", "colId": "c1", "checkConstraintName": "check1"}, ExpressionId: "expr1"}},
+		},
+	})
+	err := common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), DbDumpImpl{}, &expressions_api.MockDDLVerifier{}, mockAccessor)
 	if err == nil {
 		t.Fatalf("Expect an error, but got nil")
 	}
@@ -1488,32 +1535,46 @@ func runProcessPgDump(s string) (*internal.Conv, []spannerData) {
 	conv := internal.MakeConv()
 	conv.SetLocation(time.UTC)
 	conv.SetSchemaMode()
+	mockAccessor := new(mocks.MockExpressionVerificationAccessor)
+	ctx := context.Background()
+	mockAccessor.On("VerifyExpressions", ctx, mock.Anything).Return(internal.VerifyExpressionsOutput{
+		ExpressionVerificationOutputList: []internal.ExpressionVerificationOutput{
+			{Result: true, Err: nil, ExpressionDetail: internal.ExpressionDetail{Expression: "(col1 > 0)", Type: "CHECK", Metadata: map[string]string{"tableId": "t1", "colId": "c1", "checkConstraintName": "check1"}, ExpressionId: "expr1"}},
+		},
+	})
 	pgDump := DbDumpImpl{}
-	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump)
+	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump, &expressions_api.MockDDLVerifier{}, mockAccessor)
 	conv.SetDataMode()
 	var rows []spannerData
 	conv.SetDataSink(
 		func(table string, cols []string, vals []interface{}) {
 			rows = append(rows, spannerData{table: table, cols: cols, vals: vals})
 		})
-	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump)
+	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump, &expressions_api.MockDDLVerifier{}, mockAccessor)
 	return conv, rows
 }
 
 func runProcessPgDumpPGTarget(s string) (*internal.Conv, []spannerData) {
 	conv := internal.MakeConv()
-	conv.TargetDb = constants.TargetExperimentalPostgres
+	conv.SpDialect = constants.DIALECT_POSTGRESQL
 	conv.SetLocation(time.UTC)
 	conv.SetSchemaMode()
+	mockAccessor := new(mocks.MockExpressionVerificationAccessor)
+	ctx := context.Background()
+	mockAccessor.On("VerifyExpressions", ctx, mock.Anything).Return(internal.VerifyExpressionsOutput{
+		ExpressionVerificationOutputList: []internal.ExpressionVerificationOutput{
+			{Result: true, Err: nil, ExpressionDetail: internal.ExpressionDetail{Expression: "(col1 > 0)", Type: "CHECK", Metadata: map[string]string{"tableId": "t1", "colId": "c1", "checkConstraintName": "check1"}, ExpressionId: "expr1"}},
+		},
+	})
 	pgDump := DbDumpImpl{}
-	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump)
+	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump, &expressions_api.MockDDLVerifier{}, mockAccessor)
 	conv.SetDataMode()
 	var rows []spannerData
 	conv.SetDataSink(
 		func(table string, cols []string, vals []interface{}) {
 			rows = append(rows, spannerData{table: table, cols: cols, vals: vals})
 		})
-	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump)
+	common.ProcessDbDump(conv, internal.NewReader(bufio.NewReader(strings.NewReader(s)), nil), pgDump, &expressions_api.MockDDLVerifier{}, mockAccessor)
 	return conv, rows
 }
 

@@ -17,12 +17,118 @@ package internal
 import (
 	"testing"
 
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestGetSpannerTable(t *testing.T) {
 	conv := MakeConv()
+
+	conv = &Conv{
+
+		SrcSchema: map[string]schema.Table{
+			"t2": {
+				Name: "table",
+				Id:   "t2",
+			},
+			"t3": {
+				Name: "tab_le_5",
+				Id:   "t3",
+			},
+			"t4": {
+				Name: "tab\nle",
+				Id:   "t4",
+			},
+			"t5": {
+				Name: "tab\tle",
+				Id:   "t5",
+			},
+			"t6": {
+				Name: "tab?le",
+				Id:   "t6",
+			},
+			"t7": {
+				Name: "tab_le_4",
+				Id:   "t7",
+			},
+			"t8": {
+				Name: "2table",
+				Id:   "t8",
+			},
+			"t9": {
+				Name: "tab_le_6",
+				Id:   "t9",
+			},
+			"t10": {
+				Name: "_table",
+				Id:   "t10",
+			},
+			"t11": {
+				Name: "\ntable",
+				Id:   "t11",
+			},
+			"t12": {
+				Name: "TABLE",
+				Id:   "t12",
+			},
+			"t13": {
+				Name: "TAB\nLE_5",
+				Id:   "t13",
+			},
+		},
+
+		SpSchema: map[string]ddl.CreateTable{
+			"t2": {
+				Name: "table",
+				Id:   "t2",
+			}, "t3": {
+				Name: "tab_le_5",
+				Id:   "t3",
+			}, "t4": {
+				Name: "tab_le",
+				Id:   "t4",
+			},
+			"t5": {
+				Name: "tab_le_4",
+				Id:   "t5",
+			},
+			"t6": {
+				Name: "tab_le_7",
+				Id:   "t6",
+			},
+			"t7": {
+				Name: "tab_le_4_6",
+				Id:   "t7",
+			},
+			"t8": {
+				Name: "Atable",
+				Id:   "t8",
+			},
+			"t9": {
+				Name: "tab_le_6",
+				Id:   "t9",
+			},
+			"t10": {
+				Name: "Atable_8",
+				Id:   "t10",
+			},
+			"t11": {
+				Name: "Atable_9",
+				Id:   "t11",
+			},
+			"t12": {
+				Name: "TABLE_10",
+				Id:   "t12",
+			},
+			"t13": {
+				Name: "TAB_LE_5_11",
+				Id:   "t13",
+			},
+		},
+	}
+
 	basicTests := []struct {
 		name     string // Name of test.
 		srcTable string // Source DB table name to test.
@@ -44,14 +150,15 @@ func TestGetSpannerTable(t *testing.T) {
 		{"Illegal differing only in case", "TAB\nLE_5", false, "TAB_LE_5_11"},
 	}
 	for _, tc := range basicTests {
-		spTable, err := GetSpannerTable(conv, tc.srcTable)
+		tableId, _ := GetTableIdFromSrcName(conv.SrcSchema, tc.srcTable)
+		spTable, err := GetSpannerTable(conv, tableId)
 		if tc.error {
 			assert.NotNil(t, err, tc.name)
 			continue
 		}
 		assert.Equal(t, tc.spTable, spTable, tc.name)
 		// Run again to check we get same result.
-		s2, err := GetSpannerTable(conv, tc.srcTable)
+		s2, err := GetSpannerTable(conv, tableId)
 		assert.Nil(t, err, tc.name)
 		assert.Equal(t, spTable, s2, tc.name)
 	}
@@ -59,6 +166,65 @@ func TestGetSpannerTable(t *testing.T) {
 
 func TestGetSpannerCol(t *testing.T) {
 	conv := MakeConv()
+	conv.SrcSchema = map[string]schema.Table{
+		"t1": {
+			Name:   "table",
+			Id:     "t1",
+			ColIds: []string{"c1", "c2"},
+			ColDefs: map[string]schema.Column{
+				"c1": {Name: "col", Id: "c1"},
+				"c2": {Name: "c\nol", Id: "c2"},
+			},
+		},
+		"t2": {
+			Name:   "ta.b\nle",
+			Id:     "t2",
+			ColIds: []string{"c3"},
+			ColDefs: map[string]schema.Column{
+				"c3": {Name: "col", Id: "c3"},
+			},
+		},
+		"t3": {
+			Name:   "t.able",
+			Id:     "t3",
+			ColIds: []string{"c4"},
+			ColDefs: map[string]schema.Column{
+				"c4": {Name: "c\no\nl", Id: "c4"},
+			},
+		},
+		"t4": {
+			Name:   "table1",
+			Id:     "t4",
+			ColIds: []string{"c5", "c6", "c7"},
+			ColDefs: map[string]schema.Column{
+				"c1": {Name: "col", Id: "c1"},
+				"c2": {Name: "c_ol", Id: "c2"},
+				"c3": {Name: "c_ol_5", Id: "c3"},
+				"c4": {Name: "c_ol_6", Id: "c4"},
+				"c5": {Name: "c\tol", Id: "c5"},
+				"c6": {Name: "c\nol", Id: "c6"},
+				"c7": {Name: "c?ol", Id: "c7"},
+			},
+		},
+	}
+	conv.SpSchema = map[string]ddl.CreateTable{
+		"t1": {
+			Name: "table",
+			Id:   "t1",
+		},
+		"t2": {
+			Name: "ta_b_le",
+			Id:   "t2",
+		},
+		"t3": {
+			Name: "t_able",
+			Id:   "t3",
+		},
+		"t4": {
+			Name: "table1",
+			Id:   "t4",
+		},
+	}
 	basicTests := []struct {
 		name     string // Name of test.
 		srcTable string // Source DB table name to test.
@@ -76,22 +242,54 @@ func TestGetSpannerCol(t *testing.T) {
 		{"table1 good name 2", "table1", "c_ol", false, "c_ol"},
 		{"table1 good name 3", "table1", "c_ol_5", false, "c_ol_5"},
 		{"table1 good name 4", "table1", "c_ol_6", false, "c_ol_6"},
-		{"table1 collision 1", "table1", "c\tol", false, "c_ol_4"},
-		{"table1 collision 2", "table1", "c\nol", false, "c_ol_7"}, // Skip c_ol_5 and c_ol_6.
-		{"table1 collision 3", "table1", "c?ol", false, "c_ol_8"},
 	}
 	for _, tc := range basicTests {
-		_, err1 := GetSpannerTable(conv, tc.srcTable) // Ensure table is known.
-		spCol, err2 := GetSpannerCol(conv, tc.srcTable, tc.srcCol, false)
+		tableId, _ := GetTableIdFromSrcName(conv.SrcSchema, tc.srcTable)
+		_, err1 := GetSpannerTable(conv, tableId) // Ensure table is known.
+		colId, _ := GetColIdFromSrcName(conv.SrcSchema[tableId].ColDefs, tc.srcCol)
+		spCol, err2 := GetSpannerCol(conv, tableId, colId, conv.SpSchema[tableId].ColDefs)
 		if tc.error {
 			assert.True(t, err1 != nil || err2 != nil, tc.name)
 			continue
 		}
 		assert.Equal(t, tc.spCol, spCol, tc.name)
-		// Run again to check we get same result.
-		spCol2, err := GetSpannerCol(conv, tc.srcTable, tc.srcCol, false)
-		assert.Nil(t, err, tc.name)
-		assert.Equal(t, spCol, spCol2, tc.name)
+	}
+
+	//Column name collision test
+	conv.SpSchema["t4"] = ddl.CreateTable{
+		Name:   "table1",
+		Id:     "t4",
+		ColIds: []string{"c5", "c6", "c7"},
+		ColDefs: map[string]ddl.ColumnDef{
+			"c1": {Name: "col", Id: "c1"},
+			"c2": {Name: "c_ol", Id: "c2"},
+			"c3": {Name: "c_ol_5", Id: "c3"},
+			"c4": {Name: "c_ol_6", Id: "c4"},
+		},
+	}
+
+	collisionTests := []struct {
+		name     string // Name of test.
+		srcTable string // Source DB table name to test.
+		srcCol   string // Source DB col name to test.
+		error    bool   // Whether an error is expected.
+		spCol    string // Expected Spanner column name.
+	}{
+		{"table1 collision 1", "table1", "c\tol", false, "c_ol_4"},
+		{"table1 collision 2", "table1", "c\nol", false, "c_ol_7"}, // Skip c_ol_5 and c_ol_6.
+		{"table1 collision 3", "table1", "c?ol", false, "c_ol_8"},
+	}
+	for _, tc := range collisionTests {
+		tableId, _ := GetTableIdFromSrcName(conv.SrcSchema, tc.srcTable)
+		_, err1 := GetSpannerTable(conv, tableId) // Ensure table is known.
+		colId, _ := GetColIdFromSrcName(conv.SrcSchema[tableId].ColDefs, tc.srcCol)
+		spCol, err2 := GetSpannerCol(conv, tableId, colId, conv.SpSchema[tableId].ColDefs)
+		if tc.error {
+			assert.True(t, err1 != nil || err2 != nil, tc.name)
+			continue
+		}
+		assert.Equal(t, tc.spCol, spCol, tc.name)
+		conv.SpSchema[tableId].ColDefs[colId] = ddl.ColumnDef{Name: spCol, Id: colId}
 	}
 }
 
@@ -108,6 +306,182 @@ func TestToSpannerForeignKey(t *testing.T) {
 	for _, tc := range basicTests {
 		spKeyName := ToSpannerForeignKey(conv, tc.srcKeyName)
 		assert.Equal(t, tc.spKeyName, spKeyName, tc.name)
+	}
+}
+
+func TestToSpannerOnDelete(t *testing.T) {
+	conv := MakeConv()
+	type arg struct {
+		conv          *Conv
+		srcTableId    string
+		srcDeleteRule string
+	}
+
+	tests := []struct {
+		name             string        // Name of test
+		args             arg           //Arguments to be passed to function
+		expectedOnDelete string        //Expected ON DELETE action
+		expectedIssues   []SchemaIssue //Expected issues to be appended to Conv
+	}{
+		{
+			name: "restrict",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t1",
+				srcDeleteRule: constants.FK_RESTRICT,
+			},
+			expectedOnDelete: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnDelete},
+		}, {
+			name: "set default",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t2",
+				srcDeleteRule: constants.FK_SET_DEFAULT,
+			},
+			expectedOnDelete: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnDelete},
+		}, {
+			name: "set null",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t3",
+				srcDeleteRule: constants.FK_SET_NULL,
+			},
+			expectedOnDelete: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnDelete},
+		}, {
+			name: "cascade",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t4",
+				srcDeleteRule: constants.FK_CASCADE,
+			},
+			expectedOnDelete: constants.FK_CASCADE,
+			expectedIssues:   nil,
+		}, {
+			name: "no action - lowercase",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t5",
+				srcDeleteRule: "no action",
+			},
+			expectedOnDelete: constants.FK_NO_ACTION,
+			expectedIssues:   nil,
+		}, {
+			name: "random",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t6",
+				srcDeleteRule: "xyz",
+			},
+			expectedOnDelete: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnDelete},
+		}, {
+			name: "fk action not read - for sources other than MySQL and Postgres",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t7",
+				srcDeleteRule: "",
+			},
+			expectedOnDelete: "",
+			expectedIssues:   []SchemaIssue{ForeignKeyActionNotSupported},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spKeyOnDelete := ToSpannerOnDelete(tc.args.conv, tc.args.srcTableId, tc.args.srcDeleteRule)
+			assert.Equal(t, tc.expectedOnDelete, spKeyOnDelete, tc.name)
+			assert.Equal(t, tc.expectedIssues, conv.SchemaIssues[tc.args.srcTableId].TableLevelIssues)
+		})
+	}
+}
+
+func TestToSpannerOnUpdate(t *testing.T) {
+	conv := MakeConv()
+	type arg struct {
+		conv          *Conv
+		srcTableId    string
+		srcUpdateRule string
+	}
+
+	tests := []struct {
+		name             string        // Name of test
+		args             arg           //Arguments to be passed to function
+		expectedOnUpdate string        //Expected ON UPDATE action
+		expectedIssues   []SchemaIssue //Expected issues to be appended to Conv
+	}{
+		{
+			name: "restrict",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t1",
+				srcUpdateRule: constants.FK_RESTRICT,
+			},
+			expectedOnUpdate: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnUpdate},
+		}, {
+			name: "set default",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t2",
+				srcUpdateRule: constants.FK_SET_DEFAULT,
+			},
+			expectedOnUpdate: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnUpdate},
+		}, {
+			name: "set null",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t3",
+				srcUpdateRule: constants.FK_SET_NULL,
+			},
+			expectedOnUpdate: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnUpdate},
+		}, {
+			name: "cascade",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t4",
+				srcUpdateRule: constants.FK_CASCADE,
+			},
+			expectedOnUpdate: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnUpdate},
+		}, {
+			name: "no action - lowercase",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t5",
+				srcUpdateRule: "no action",
+			},
+			expectedOnUpdate: constants.FK_NO_ACTION,
+			expectedIssues:   nil,
+		}, {
+			name: "random",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t6",
+				srcUpdateRule: "xyz",
+			},
+			expectedOnUpdate: constants.FK_NO_ACTION,
+			expectedIssues:   []SchemaIssue{ForeignKeyOnUpdate},
+		}, {
+			name: "fk action not read - for sources other than MySQL and Postgres",
+			args: arg{
+				conv:          conv,
+				srcTableId:    "t7",
+				srcUpdateRule: "",
+			},
+			expectedOnUpdate: "",
+			expectedIssues:   []SchemaIssue{ForeignKeyActionNotSupported},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spKeyOUpdate := ToSpannerOnUpdate(tc.args.conv, tc.args.srcTableId, tc.args.srcUpdateRule)
+			assert.Equal(t, tc.expectedOnUpdate, spKeyOUpdate, tc.name)
+			assert.Equal(t, tc.expectedIssues, conv.SchemaIssues[tc.args.srcTableId].TableLevelIssues)
+		})
 	}
 }
 
@@ -134,7 +508,7 @@ func TestGetSpannerID(t *testing.T) {
 		{"Bad name with different case collision", "IN\tDex", "IN_Dex_13"},
 	}
 	for _, tc := range basicTests {
-		spKeyName := getSpannerID(conv, tc.srcKeyName)
+		spKeyName := getSpannerValidName(conv, tc.srcKeyName)
 		assert.Equal(t, tc.spKeyName, spKeyName, tc.name)
 	}
 }
@@ -147,162 +521,78 @@ func TestResolveRefs(t *testing.T) {
 		unexpecteds      int64      // Expected unexpected conditions
 	}{
 		{
-			name: "Table name case mismatch",
+			name: "Refer column Id not found",
 			spSchema: map[string]ddl.CreateTable{
-				"a": {
-					Name:     "a",
-					ColNames: []string{"acol1", "acol2"},
+				"t1": {
+					Name:   "cc",
+					Id:     "t1",
+					ColIds: []string{"c1", "c2", "c3"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"acol1": {Name: "acol1", T: ddl.Type{Name: ddl.Int64}},
-						"acol2": {Name: "acol2", T: ddl.Type{Name: ddl.Int64}},
+						"c1": {Name: "ccol1", T: ddl.Type{Name: ddl.Int64}},
+						"c2": {Name: "ccol2", T: ddl.Type{Name: ddl.Int64}},
+						"c3": {Name: "ccol3", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Fks: []ddl.Foreignkey{{Name: "fk_test", Columns: []string{"acol1"}, ReferTable: "bB", ReferColumns: []string{"bcol1"}}},
+					ForeignKeys: []ddl.Foreignkey{{Name: "fk_test3", ColIds: []string{"c2", "c3"}, ReferTableId: "t2", ReferColumnIds: []string{"c4", "c9"}}},
 				},
-				"bb": {
-					Name:     "bb",
-					ColNames: []string{"bcol1", "bcol2", "bcol3"},
+				"t2": {
+					Name:   "dd",
+					Id:     "t2",
+					ColIds: []string{"c4", "c5", "c6"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"bcol1": {Name: "bcol1", T: ddl.Type{Name: ddl.Int64}},
-						"bcol2": {Name: "bcol2", T: ddl.Type{Name: ddl.Int64}},
-						"bcol3": {Name: "bcol3", T: ddl.Type{Name: ddl.Int64}},
+						"c4": {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
+						"c5": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
+						"c6": {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
 					},
 				},
 			},
 			expectedSpSchema: map[string]ddl.CreateTable{
-				"a": {
-					Name:     "a",
-					ColNames: []string{"acol1", "acol2"},
+				"t1": {
+					Name:   "cc",
+					Id:     "t1",
+					ColIds: []string{"c1", "c2", "c3"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"acol1": {Name: "acol1", T: ddl.Type{Name: ddl.Int64}},
-						"acol2": {Name: "acol2", T: ddl.Type{Name: ddl.Int64}},
-					},
-					Fks: []ddl.Foreignkey{{Name: "fk_test", Columns: []string{"acol1"}, ReferTable: "bb", ReferColumns: []string{"bcol1"}}},
-				},
-				"bb": {
-					Name:     "bb",
-					ColNames: []string{"bcol1", "bcol2", "bcol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"bcol1": {Name: "bcol1", T: ddl.Type{Name: ddl.Int64}},
-						"bcol2": {Name: "bcol2", T: ddl.Type{Name: ddl.Int64}},
-						"bcol3": {Name: "bcol3", T: ddl.Type{Name: ddl.Int64}},
+						"c1": {Name: "ccol1", T: ddl.Type{Name: ddl.Int64}},
+						"c2": {Name: "ccol2", T: ddl.Type{Name: ddl.Int64}},
+						"c3": {Name: "ccol3", T: ddl.Type{Name: ddl.Int64}},
 					},
 				},
-			},
-			unexpecteds: 0,
-		},
-		{
-			name: "Column name case mismatch",
-			spSchema: map[string]ddl.CreateTable{
-				"bb": {
-					Name:     "bb",
-					ColNames: []string{"bcol1", "bcol2", "bcol3"},
+				"t2": {
+					Name:   "dd",
+					Id:     "t2",
+					ColIds: []string{"c4", "c5", "c6"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"bcol1": {Name: "bcol1", T: ddl.Type{Name: ddl.Int64}},
-						"bcol2": {Name: "bcol2", T: ddl.Type{Name: ddl.Int64}},
-						"bcol3": {Name: "bcol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-					Fks: []ddl.Foreignkey{{Name: "fk_test2", Columns: []string{"bcol2", "bcol3"}, ReferTable: "cc", ReferColumns: []string{"cCol1", "ccol2"}}},
-				},
-				"cc": {
-					Name:     "cc",
-					ColNames: []string{"ccol1", "ccol2", "ccol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"ccol1": {Name: "ccol1", T: ddl.Type{Name: ddl.Int64}},
-						"ccol2": {Name: "ccol2", T: ddl.Type{Name: ddl.Int64}},
-						"ccol3": {Name: "ccol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-				},
-			},
-			expectedSpSchema: map[string]ddl.CreateTable{
-				"bb": {
-					Name:     "bb",
-					ColNames: []string{"bcol1", "bcol2", "bcol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"bcol1": {Name: "bcol1", T: ddl.Type{Name: ddl.Int64}},
-						"bcol2": {Name: "bcol2", T: ddl.Type{Name: ddl.Int64}},
-						"bcol3": {Name: "bcol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-					Fks: []ddl.Foreignkey{{Name: "fk_test2", Columns: []string{"bcol2", "bcol3"}, ReferTable: "cc", ReferColumns: []string{"ccol1", "ccol2"}}},
-				},
-				"cc": {
-					Name:     "cc",
-					ColNames: []string{"ccol1", "ccol2", "ccol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"ccol1": {Name: "ccol1", T: ddl.Type{Name: ddl.Int64}},
-						"ccol2": {Name: "ccol2", T: ddl.Type{Name: ddl.Int64}},
-						"ccol3": {Name: "ccol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-				},
-			},
-			unexpecteds: 0,
-		},
-		{
-			name: "Column name not found after lower case check",
-			spSchema: map[string]ddl.CreateTable{
-				"cc": {
-					Name:     "cc",
-					ColNames: []string{"ccol1", "ccol2", "ccol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"ccol1": {Name: "ccol1", T: ddl.Type{Name: ddl.Int64}},
-						"ccol2": {Name: "ccol2", T: ddl.Type{Name: ddl.Int64}},
-						"ccol3": {Name: "ccol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-					Fks: []ddl.Foreignkey{{Name: "fk_test3", Columns: []string{"ccol2", "ccol3"}, ReferTable: "dd", ReferColumns: []string{"dcol1", "dcol2"}}},
-				},
-				"dd": {
-					Name:     "dd",
-					ColNames: []string{"dcol1", "ddcol2", "dcol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"dcol1":  {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
-						"ddcol2": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
-						"dcol3":  {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-				},
-			},
-			expectedSpSchema: map[string]ddl.CreateTable{
-				"cc": {
-					Name:     "cc",
-					ColNames: []string{"ccol1", "ccol2", "ccol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"ccol1": {Name: "ccol1", T: ddl.Type{Name: ddl.Int64}},
-						"ccol2": {Name: "ccol2", T: ddl.Type{Name: ddl.Int64}},
-						"ccol3": {Name: "ccol3", T: ddl.Type{Name: ddl.Int64}},
-					},
-				},
-				"dd": {
-					Name:     "dd",
-					ColNames: []string{"dcol1", "ddcol2", "dcol3"},
-					ColDefs: map[string]ddl.ColumnDef{
-						"dcol1":  {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
-						"ddcol2": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
-						"dcol3":  {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
+						"c4": {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
+						"c5": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
+						"c6": {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
 					},
 				},
 			},
 			unexpecteds: 1,
 		},
 		{
-			name: "Table name not found after lower case check",
+			name: "Refer table Id not found",
 			spSchema: map[string]ddl.CreateTable{
-				"dd": {
-					Name:     "dd",
-					ColNames: []string{"dcol1", "ddcol2", "dcol3"},
+				"t1": {
+					Name:   "dd",
+					Id:     "t1",
+					ColIds: []string{"c1", "c2", "c3"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"dcol1":  {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
-						"ddcol2": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
-						"dcol3":  {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
+						"c1": {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
+						"c2": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
+						"c3": {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
 					},
-					Fks: []ddl.Foreignkey{{Name: "fk_test4", Columns: []string{"dcol3"}, ReferTable: "ee", ReferColumns: []string{"ecol1"}}},
+					ForeignKeys: []ddl.Foreignkey{{Name: "fk_test4", ColIds: []string{"c3"}, ReferTableId: "t3", ReferColumnIds: []string{"c6"}}},
 				},
 			},
 			expectedSpSchema: map[string]ddl.CreateTable{
-				"dd": {
-					Name:     "dd",
-					ColNames: []string{"dcol1", "ddcol2", "dcol3"},
+				"t1": {
+					Name:   "dd",
+					Id:     "t1",
+					ColIds: []string{"c1", "c2", "c3"},
 					ColDefs: map[string]ddl.ColumnDef{
-						"dcol1":  {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
-						"ddcol2": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
-						"dcol3":  {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
+						"c1": {Name: "dcol1", T: ddl.Type{Name: ddl.Int64}},
+						"c2": {Name: "ddcol2", T: ddl.Type{Name: ddl.Int64}},
+						"c3": {Name: "dcol3", T: ddl.Type{Name: ddl.Int64}},
 					},
 				},
 			},

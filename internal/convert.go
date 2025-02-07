@@ -16,36 +16,66 @@ package internal
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
-	"github.com/cloudspannerecosystem/harbourbridge/logger"
-	"github.com/cloudspannerecosystem/harbourbridge/proto/migration"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/logger"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/proto/migration"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 	"go.uber.org/zap"
 	"google.golang.org/genproto/googleapis/type/datetime"
 )
 
 // Conv contains all schema and data conversion state.
 type Conv struct {
-	mode           mode                                // Schema mode or data mode.
-	SpSchema       ddl.Schema                          // Maps Spanner table name to Spanner schema.
-	SyntheticPKeys map[string]SyntheticPKey            // Maps Spanner table name to synthetic primary key (if needed).
-	SrcSchema      map[string]schema.Table             // Maps source-DB table name to schema information.
-	Issues         map[string]map[string][]SchemaIssue // Maps source-DB table/col to list of schema conversion issues.
-	ToSpanner      map[string]NameAndCols              // Maps from source-DB table name to Spanner name and column mapping.
-	ToSource       map[string]NameAndCols              // Maps from Spanner table name to source-DB table name and column mapping.
-	UsedNames      map[string]bool                     // Map storing the names that are already assigned to tables, indices or foreign key contraints.
-	dataSink       func(table string, cols []string, values []interface{})
-	DataFlush      func()         `json:"-"` // Data flush is used to flush out remaining writes and wait for them to complete.
-	Location       *time.Location // Timezone (for timestamp conversion).
-	sampleBadRows  rowSamples     // Rows that generated errors during conversion.
-	Stats          stats
-	TimezoneOffset string              // Timezone offset for timestamp conversion.
-	TargetDb       string              // The target database to which HarbourBridge is writing.
-	UniquePKey     map[string][]string // Maps Spanner table name to unique column name being used as primary key (if needed).
-	Audit          Audit               // Stores the audit information for the database conversion
-	Rules          []Rule              // Stores applied rules during schema conversion
+	mode               mode                         // Schema mode or data mode.
+	SpSchema           ddl.Schema                   // Maps Spanner table name to Spanner schema.
+	SyntheticPKeys     map[string]SyntheticPKey     // Maps Spanner table name to synthetic primary key (if needed).
+	SrcSchema          map[string]schema.Table      // Maps source-DB table name to schema information.
+	SchemaIssues       map[string]TableIssues       // Maps source-DB table/col to list of schema conversion issues.
+	InvalidCheckExp    map[string][]InvalidCheckExp // List of check constraint expressions and corresponding issues.
+	ToSpanner          map[string]NameAndCols       `json:"-"` // Maps from source-DB table name to Spanner name and column mapping.
+	ToSource           map[string]NameAndCols       `json:"-"` // Maps from Spanner table name to source-DB table name and column mapping.
+	UsedNames          map[string]bool              `json:"-"` // Map storing the names that are already assigned to tables, indices or foreign key contraints.
+	dataSink           func(table string, cols []string, values []interface{})
+	DataFlush          func()                  `json:"-"` // Data flush is used to flush out remaining writes and wait for them to complete.
+	Location           *time.Location          // Timezone (for timestamp conversion).
+	sampleBadRows      rowSamples              // Rows that generated errors during conversion.
+	Stats              stats                   `json:"-"`
+	TimezoneOffset     string                  // Timezone offset for timestamp conversion.
+	SpDialect          string                  // The dialect of the spanner database to which Spanner migration tool is writing.
+	UniquePKey         map[string][]string     // Maps Spanner table name to unique column name being used as primary key (if needed).
+	Audit              Audit                   `json:"-"` // Stores the audit information for the database conversion
+	Rules              []Rule                  // Stores applied rules during schema conversion
+	IsSharded          bool                    // Flag denoting if the migration is sharded or not
+	ConvLock           sync.RWMutex            `json:"-"` // ConvLock prevents concurrent map read/write operations. This lock will be used in all the APIs that either read or write elements to the conv object.
+	SpRegion           string                  // Leader Region for Spanner Instance
+	ResourceValidation bool                    // Flag denoting if validation for resources to generated is complete
+	UI                 bool                    // Flag if UI interface was used for migration. ToDo: Remove flag after resource generation is introduced to UI
+	SpSequences        map[string]ddl.Sequence // Maps Spanner Sequences to Sequence Schema
+	SrcSequences       map[string]ddl.Sequence // Maps source-DB Sequences to Sequence schema information
+	SpProjectId        string                  // Spanner Project Id
+	SpInstanceId       string                  // Spanner Instance Id
+	Source             string                  // Source Database type being migrated
+}
+
+type InvalidCheckExp struct {
+	IssueType  SchemaIssue
+	Expression string
+}
+
+type TableIssues struct {
+	ColumnLevelIssues map[string][]SchemaIssue
+	TableLevelIssues  []SchemaIssue
+}
+
+type AdditionalSchemaAttributes struct {
+	IsSharded bool
+}
+
+type AdditionalDataAttributes struct {
+	ShardId string
 }
 
 type mode int
@@ -59,7 +89,7 @@ const (
 // count for a table, if needed. We use a synthetic primary key when
 // the source DB table has no primary key.
 type SyntheticPKey struct {
-	Col      string
+	ColId    string
 	Sequence int64
 }
 
@@ -73,6 +103,7 @@ const (
 	DefaultValue SchemaIssue = iota
 	ForeignKey
 	MissingPrimaryKey
+	UniqueIndexPrimaryKey
 	MultiDimensionalArray
 	NoGoodType
 	Numeric
@@ -96,6 +127,32 @@ const (
 	InterleavedAddColumn
 	IllegalName
 	InterleavedRenameColumn
+	InterleavedChangeColumnSize
+	RowLimitExceeded
+	ShardIdColumnAdded
+	ShardIdColumnPrimaryKey
+	ArrayTypeNotSupported
+	ForeignKeyOnDelete
+	ForeignKeyOnUpdate
+	SequenceCreated
+	ForeignKeyActionNotSupported
+	NumericPKNotSupported
+	TypeMismatch
+	TypeMismatchError
+	DefaultValueError
+	InvalidCondition
+	InvalidConditionError
+	ColumnNotFound
+	ColumnNotFoundError
+	CheckConstraintFunctionNotFound
+	CheckConstraintFunctionNotFoundError
+	GenericError
+	GenericWarning
+)
+
+const (
+	ShardIdColumn       = "migration_shard_id"
+	SyntheticPrimaryKey = "synth_id"
 )
 
 // NameAndCols contains the name of a table and its columns.
@@ -149,8 +206,6 @@ type statementStat struct {
 // Stores the audit information of conversion.
 // Elements that do not affect the migration functionality but are relevant for the migration metadata.
 type Audit struct {
-	ToSpannerFkIdx           map[string]FkeyAndIdxs                 // Maps from source-DB table name to Spanner names for table name, foreign key and indexes.
-	ToSourceFkIdx            map[string]FkeyAndIdxs                 // Maps from Spanner table name to source-DB names for table name, foreign key and indexes.
 	SchemaConversionDuration time.Duration                          `json:"-"` // Duration of schema conversion.
 	DataConversionDuration   time.Duration                          `json:"-"` // Duration of data conversion.
 	MigrationRequestId       string                                 `json:"-"` // Unique request id generated per migration
@@ -158,18 +213,77 @@ type Audit struct {
 	DryRun                   bool                                   `json:"-"` // Flag to identify if the migration is a dry run.
 	StreamingStats           streamingStats                         `json:"-"` // Stores information related to streaming migration process.
 	Progress                 Progress                               `json:"-"` // Stores information related to progress of the migration progress
+	SkipMetricsPopulation    bool                                   `json:"-"` // Flag to identify if outgoing metrics metadata needs to skipped
+}
+
+// Stores information related to generated Dataflow Resources.
+type DataflowResources struct {
+	JobId     string `json:"JobId"`
+	GcloudCmd string `json:"GcloudCmd"`
+	Region    string `json:"Region"`
+}
+
+type GcsResources struct {
+	BucketName string `json:"BucketName"`
+}
+
+// Stores information related to generated Datastream Resources.
+type DatastreamResources struct {
+	DatastreamName string `json:"DatastreamName"`
+	Region         string `json:"Region"`
+}
+
+// Stores information related to generated Pubsub Resources.
+type PubsubResources struct {
+	TopicId        string
+	SubscriptionId string
+	NotificationId string
+	BucketName     string
+	Region         string
+}
+
+// Stores information related to Monitoring resources
+type MonitoringResources struct {
+	DashboardName string `json:"DashboardName"`
+}
+
+type ShardResources struct {
+	DatastreamResources DatastreamResources
+	PubsubResources     PubsubResources
+	DlqPubsubResources  PubsubResources
+	DataflowResources   DataflowResources
+	GcsResources        GcsResources
+	MonitoringResources MonitoringResources
 }
 
 // Stores information related to the streaming migration process.
 type streamingStats struct {
-	Streaming        bool                        // Flag for confirmation of streaming migration.
-	TotalRecords     map[string]map[string]int64 // Tablewise count of records received for processing, broken down by record type i.e. INSERT, MODIFY & REMOVE.
-	BadRecords       map[string]map[string]int64 // Tablewise count of records not converted successfully, broken down by record type.
-	DroppedRecords   map[string]map[string]int64 // Tablewise count of records successfully converted but failed to written on Spanner, broken down by record type.
-	SampleBadRecords []string                    // Records that generated errors during conversion.
-	SampleBadWrites  []string                    // Records that faced errors while writing to Cloud Spanner.
-	DataStreamName   string
-	DataflowJobId    string
+	Streaming                bool                        // Flag for confirmation of streaming migration.
+	TotalRecords             map[string]map[string]int64 // Tablewise count of records received for processing, broken down by record type i.e. INSERT, MODIFY & REMOVE.
+	BadRecords               map[string]map[string]int64 // Tablewise count of records not converted successfully, broken down by record type.
+	DroppedRecords           map[string]map[string]int64 // Tablewise count of records successfully converted but failed to written on Spanner, broken down by record type.
+	SampleBadRecords         []string                    // Records that generated errors during conversion.
+	SampleBadWrites          []string                    // Records that faced errors while writing to Cloud Spanner.
+	DatastreamResources      DatastreamResources
+	DataflowResources        DataflowResources
+	PubsubResources          PubsubResources
+	DlqPubsubResources       PubsubResources
+	GcsResources             GcsResources
+	MonitoringResources      MonitoringResources
+	ShardToShardResourcesMap map[string]ShardResources
+	AggMonitoringResources   MonitoringResources
+}
+
+type PubsubCfg struct {
+	TopicId        string
+	SubscriptionId string
+	NotificationId string
+	BucketName     string
+}
+
+type DataflowOutput struct {
+	JobID     string
+	GCloudCmd string
 }
 
 // Stores information related to rules during schema conversion
@@ -184,13 +298,54 @@ type Rule struct {
 	AddedOn           datetime.DateTime
 }
 
+type Tables struct {
+	TableList []string `json:"TableList"`
+}
+
+type SchemaDetails struct {
+	TableDetails []TableDetails `json:TableDetails`
+}
+
+type TableDetails struct {
+	TableName string `json:TableName`
+}
+
+type VerifyExpressionsInput struct {
+	Conv                 *Conv
+	Source               string
+	ExpressionDetailList []ExpressionDetail
+}
+
+type ExpressionDetail struct {
+	ReferenceElement ReferenceElement
+	ExpressionId     string
+	Expression       string
+	Type             string
+	Metadata         map[string]string
+}
+
+type ReferenceElement struct {
+	Name string
+}
+
+type ExpressionVerificationOutput struct {
+	ExpressionDetail ExpressionDetail
+	Result           bool
+	Err              error
+}
+
+type VerifyExpressionsOutput struct {
+	ExpressionVerificationOutputList []ExpressionVerificationOutput
+	Err                              error
+}
+
 // MakeConv returns a default-configured Conv.
 func MakeConv() *Conv {
 	return &Conv{
 		SpSchema:       ddl.NewSchema(),
 		SyntheticPKeys: make(map[string]SyntheticPKey),
 		SrcSchema:      make(map[string]schema.Table),
-		Issues:         make(map[string]map[string][]SchemaIssue),
+		SchemaIssues:   make(map[string]TableIssues),
 		ToSpanner:      make(map[string]NameAndCols),
 		ToSource:       make(map[string]NameAndCols),
 		UsedNames:      make(map[string]bool),
@@ -206,12 +361,12 @@ func MakeConv() *Conv {
 		TimezoneOffset: "+00:00", // By default, use +00:00 offset which is equal to UTC timezone
 		UniquePKey:     make(map[string][]string),
 		Audit: Audit{
-			ToSpannerFkIdx: make(map[string]FkeyAndIdxs),
-			ToSourceFkIdx:  make(map[string]FkeyAndIdxs),
 			StreamingStats: streamingStats{},
 			MigrationType:  migration.MigrationData_SCHEMA_ONLY.Enum(),
 		},
-		Rules: []Rule{},
+		Rules:        []Rule{},
+		SpSequences:  make(map[string]ddl.Sequence),
+		SrcSequences: make(map[string]ddl.Sequence),
 	}
 }
 
@@ -337,11 +492,27 @@ func (conv *Conv) SampleBadRows(n int) []string {
 	return l
 }
 
+func (conv *Conv) AddShardIdColumn() {
+	for t, ct := range conv.SpSchema {
+		if ct.ShardIdColumn == "" {
+			colName := conv.buildColumnNameWithBase(t, ShardIdColumn)
+			columnId := GenerateColumnId()
+			ct.ColIds = append(ct.ColIds, columnId)
+			ct.ColDefs[columnId] = ddl.ColumnDef{Name: colName, Id: columnId, T: ddl.Type{Name: ddl.String, Len: 50}, NotNull: false, AutoGen: ddl.AutoGenCol{Name: "", GenerationType: ""}}
+			ct.ShardIdColumn = columnId
+			conv.SpSchema[t] = ct
+			var issues []SchemaIssue
+			issues = append(issues, ShardIdColumnAdded, ShardIdColumnPrimaryKey)
+			conv.SchemaIssues[ct.Id].ColumnLevelIssues[columnId] = issues
+		}
+	}
+}
+
 // AddPrimaryKeys analyzes all tables in conv.schema and adds synthetic primary
 // keys for any tables that don't have primary key.
 func (conv *Conv) AddPrimaryKeys() {
 	for t, ct := range conv.SpSchema {
-		if len(ct.Pks) == 0 {
+		if len(ct.PrimaryKeys) == 0 {
 			primaryKeyPopulated := false
 			// Populating column with unique constraint as primary key in case
 			// table doesn't have primary key and removing the unique index.
@@ -349,8 +520,9 @@ func (conv *Conv) AddPrimaryKeys() {
 				for i, index := range ct.Indexes {
 					if index.Unique {
 						for _, indexKey := range index.Keys {
-							ct.Pks = append(ct.Pks, ddl.IndexKey{Col: indexKey.Col, Desc: indexKey.Desc})
-							conv.UniquePKey[t] = append(conv.UniquePKey[t], indexKey.Col)
+							ct.PrimaryKeys = append(ct.PrimaryKeys, ddl.IndexKey{ColId: indexKey.ColId, Desc: indexKey.Desc, Order: indexKey.Order})
+							conv.UniquePKey[t] = append(conv.UniquePKey[t], indexKey.ColId)
+							addMissingPrimaryKeyWarning(ct.Id, indexKey.ColId, conv, UniqueIndexPrimaryKey)
 						}
 						primaryKeyPopulated = true
 						ct.Indexes = append(ct.Indexes[:i], ct.Indexes[i+1:]...)
@@ -359,14 +531,32 @@ func (conv *Conv) AddPrimaryKeys() {
 				}
 			}
 			if !primaryKeyPopulated {
-				k := conv.buildPrimaryKey(t)
-				ct.ColNames = append(ct.ColNames, k)
-				ct.ColDefs[k] = ddl.ColumnDef{Name: k, T: ddl.Type{Name: ddl.String, Len: 50}}
-				ct.Pks = []ddl.IndexKey{{Col: k}}
-				conv.SyntheticPKeys[t] = SyntheticPKey{k, 0}
+				k := conv.buildColumnNameWithBase(t, SyntheticPrimaryKey)
+				columnId := GenerateColumnId()
+				ct.ColIds = append(ct.ColIds, columnId)
+				ct.ColDefs[columnId] = ddl.ColumnDef{Name: k, Id: columnId, T: ddl.Type{Name: ddl.String, Len: 50}, AutoGen: ddl.AutoGenCol{Name: "", GenerationType: ""}}
+				ct.PrimaryKeys = []ddl.IndexKey{{ColId: columnId, Order: 1}}
+				conv.SyntheticPKeys[t] = SyntheticPKey{columnId, 0}
+				addMissingPrimaryKeyWarning(ct.Id, columnId, conv, MissingPrimaryKey)
 			}
 			conv.SpSchema[t] = ct
 		}
+	}
+}
+
+// Add 'Missing Primary Key' as a Warning inside ColumnLevelIssues of conv object
+func addMissingPrimaryKeyWarning(tableId string, colId string, conv *Conv, schemaIssue SchemaIssue) {
+	tableLevelIssues := conv.SchemaIssues[tableId].TableLevelIssues
+	var columnLevelIssues map[string][]SchemaIssue
+	if tableIssues, ok := conv.SchemaIssues[tableId]; ok {
+		columnLevelIssues = tableIssues.ColumnLevelIssues
+	} else {
+		columnLevelIssues = make(map[string][]SchemaIssue)
+	}
+	columnLevelIssues[colId] = append(columnLevelIssues[colId], schemaIssue)
+	conv.SchemaIssues[tableId] = TableIssues{
+		TableLevelIssues:  tableLevelIssues,
+		ColumnLevelIssues: columnLevelIssues,
 	}
 }
 
@@ -375,17 +565,23 @@ func (conv *Conv) SetLocation(loc *time.Location) {
 	conv.Location = loc
 }
 
-func (conv *Conv) buildPrimaryKey(spTable string) string {
-	base := "synth_id"
-	if _, ok := conv.ToSource[spTable]; !ok {
-		conv.Unexpected(fmt.Sprintf("ToSource lookup fails for table %s: ", spTable))
+func (conv *Conv) buildColumnNameWithBase(tableId, base string) string {
+	if _, ok := conv.SpSchema[tableId]; !ok {
+		conv.Unexpected(fmt.Sprintf("Table doesn't exist for tableId %s: ", tableId))
 		return base
 	}
 	count := 0
 	key := base
 	for {
 		// Check key isn't already a column in the table.
-		if _, ok := conv.ToSource[spTable].Cols[key]; !ok {
+		ok := true
+		for _, column := range conv.SpSchema[tableId].ColDefs {
+			if column.Name == key {
+				ok = false
+				break
+			}
+		}
+		if ok {
 			return key
 		}
 		key = fmt.Sprintf("%s%d", base, count)

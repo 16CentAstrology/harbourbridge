@@ -20,7 +20,7 @@ export class LoadSessionComponent implements OnInit {
   ) {}
 
   connectForm = new FormGroup({
-    dbEngine: new FormControl('sqlserver', [Validators.required]),
+    dbEngine: new FormControl('mysql', [Validators.required]),
     filePath: new FormControl('', [Validators.required]),
   })
 
@@ -35,7 +35,17 @@ export class LoadSessionComponent implements OnInit {
   uploadSuccess: boolean = false
   uploadFail: boolean = false
 
-  ngOnInit(): void {}
+  getSchemaRequest: any = null
+
+  ngOnInit(): void {
+    this.clickEvent.cancelDbLoad.subscribe({
+      next: (res: boolean) => {
+        if (res && this.getSchemaRequest) {
+          this.getSchemaRequest.unsubscribe()
+        }
+      },
+    })
+  }
 
   convertFromSessionFile() {
     this.clickEvent.openDatabaseLoader('session', '')
@@ -43,14 +53,14 @@ export class LoadSessionComponent implements OnInit {
     localStorage.clear()
     const { dbEngine, filePath } = this.connectForm.value
     const payload: ISessionConfig = {
-      driver: dbEngine,
-      filePath: filePath,
+      driver: dbEngine!,
+      filePath: filePath!,
     }
-    this.data.getSchemaConversionFromSession(payload)
+    this.getSchemaRequest = this.data.getSchemaConversionFromSession(payload)
     this.data.conv.subscribe((res) => {
       localStorage.setItem(StorageKeys.Config, JSON.stringify(payload))
       localStorage.setItem(StorageKeys.Type, InputType.SessionFile)
-      localStorage.setItem(StorageKeys.SourceDbName, extractSourceDbName(dbEngine))
+      localStorage.setItem(StorageKeys.SourceDbName, extractSourceDbName(dbEngine!))
       this.clickEvent.closeDatabaseLoader()
       this.router.navigate(['/workspace'])
     })

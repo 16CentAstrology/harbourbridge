@@ -25,21 +25,26 @@ import (
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 	xj "github.com/basgys/goxml2json"
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
 )
 
-func ProcessDataRow(conv *internal.Conv, srcTable string, srcCols []string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable, vals []string) {
-	spTable, cvtCols, cvtVals, err := convertData(conv, srcTable, srcCols, srcSchema, spTable, spCols, spSchema, vals)
+func ProcessDataRow(conv *internal.Conv, tableId string, colIds []string, srcSchema schema.Table, spSchema ddl.CreateTable, vals []string) {
+	spTableName, cvtCols, cvtVals, err := convertData(conv, tableId, colIds, srcSchema, spSchema, vals)
+	srcTableName := srcSchema.Name
+	srcCols := []string{}
+	for _, colId := range colIds {
+		srcCols = append(srcCols, srcSchema.ColDefs[colId].Name)
+	}
 	if err != nil {
 		conv.Unexpected(fmt.Sprintf("Error while converting data: %s\n", err))
-		conv.StatsAddBadRow(srcTable, conv.DataMode())
-		conv.CollectBadRow(srcTable, srcCols, vals)
+		conv.StatsAddBadRow(srcTableName, conv.DataMode())
+		conv.CollectBadRow(srcTableName, srcCols, vals)
 	} else {
-		conv.WriteRow(srcTable, spTable, cvtCols, cvtVals)
+		conv.WriteRow(srcTableName, spTableName, cvtCols, cvtVals)
 	}
 }
 
@@ -47,23 +52,24 @@ func ProcessDataRow(conv *internal.Conv, srcTable string, srcCols []string, srcS
 // based on the Spanner and source DB schemas. Note that since entries
 // in vals may be empty, we also return the list of columns (empty
 // cols are dropped).
-func convertData(conv *internal.Conv, srcTable string, srcCols []string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable, vals []string) (string, []string, []interface{}, error) {
+func convertData(conv *internal.Conv, tableId string, colIds []string, srcSchema schema.Table, spSchema ddl.CreateTable, vals []string) (string, []string, []interface{}, error) {
 	var c []string
 	var v []interface{}
-	if len(spCols) != len(srcCols) || len(spCols) != len(vals) {
-		return "", []string{}, []interface{}{}, fmt.Errorf("ConvertData: spCols, srcCols and vals don't all have the same lengths: len(spCols)=%d, len(srcCols)=%d, len(vals)=%d", len(spCols), len(srcCols), len(vals))
+	if len(colIds) != len(vals) {
+		return "", []string{}, []interface{}{}, fmt.Errorf("ConvertData: colIds and vals don't all have the same lengths: len(colIds)=%d, len(vals)=%d", len(colIds), len(vals))
 	}
-	for i, spCol := range spCols {
-		srcCol := srcCols[i]
+	for i, colId := range colIds {
 		// Skip columns with 'NULL' values., these values
 		// 'NULL' values are represented as "NULL" (because we retrieve the values as strings).
 		if vals[i] == "NULL" {
 			continue
 		}
-		spColDef, ok1 := spSchema.ColDefs[spCol]
-		srcColDef, ok2 := srcSchema.ColDefs[srcCol]
+
+		spColDef, ok1 := spSchema.ColDefs[colId]
+		srcColDef, ok2 := srcSchema.ColDefs[colId]
+
 		if !ok1 || !ok2 {
-			return "", []string{}, []interface{}{}, fmt.Errorf("can't find Spanner and source-db schema for col %s", spCol)
+			return "", []string{}, []interface{}{}, fmt.Errorf("can't find Spanner and source-db schema for column id %s", colId)
 		}
 		var x interface{}
 		var err error
@@ -76,15 +82,15 @@ func convertData(conv *internal.Conv, srcTable string, srcCols []string, srcSche
 			return "", []string{}, []interface{}{}, err
 		}
 		v = append(v, x)
-		c = append(c, spCol)
+		c = append(c, spColDef.Name)
 	}
-	if aux, ok := conv.SyntheticPKeys[spTable]; ok {
-		c = append(c, aux.Col)
+	if aux, ok := conv.SyntheticPKeys[tableId]; ok {
+		c = append(c, conv.SpSchema[tableId].ColDefs[aux.ColId].Name)
 		v = append(v, fmt.Sprintf("%d", int64(bits.Reverse64(uint64(aux.Sequence)))))
 		aux.Sequence++
-		conv.SyntheticPKeys[spTable] = aux
+		conv.SyntheticPKeys[tableId] = aux
 	}
-	return spTable, c, v, nil
+	return spSchema.Name, c, v, nil
 }
 
 // convScalar converts a source database string value to an
@@ -103,6 +109,8 @@ func convScalar(conv *internal.Conv, spannerType ddl.Type, srcTypeName string, T
 		return convBytes(val)
 	case ddl.Date:
 		return convDate(val)
+	case ddl.Float32:
+		return convFloat32(val)
 	case ddl.Float64:
 		return convFloat64(val)
 	case ddl.Int64:
@@ -113,7 +121,7 @@ func convScalar(conv *internal.Conv, spannerType ddl.Type, srcTypeName string, T
 		return val, nil
 	case ddl.Timestamp:
 		return convTimestamp(srcTypeName, val)
-	case ddl.JSON, ddl.JSONB:
+	case ddl.JSON:
 		if srcTypeName == "OBJECT" {
 			return convertXmlToJson(val)
 		}
@@ -152,6 +160,14 @@ func convDate(val string) (civil.Date, error) {
 	return d, err
 }
 
+func convFloat32(val string) (float32, error) {
+	f, err := strconv.ParseFloat(val, 32)
+	if err != nil {
+		return float32(f), fmt.Errorf("can't convert to float32: %w", err)
+	}
+	return float32(f), err
+}
+
 func convFloat64(val string) (float64, error) {
 	f, err := strconv.ParseFloat(val, 64)
 	if err != nil {
@@ -171,7 +187,7 @@ func convInt64(val string) (int64, error) {
 // convNumeric maps a source database string value (representing a numeric)
 // into a string representing a valid Spanner numeric.
 func convNumeric(conv *internal.Conv, val string) (interface{}, error) {
-	if conv.TargetDb == constants.TargetExperimentalPostgres {
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
 		return spanner.PGNumeric{Numeric: val, Valid: true}, nil
 	} else {
 		r := new(big.Rat)
@@ -261,6 +277,25 @@ func convArray(spannerType ddl.Type, srcTypeName string, v string) (interface{},
 				return []spanner.NullInt64{}, err
 			}
 			r = append(r, spanner.NullInt64{Int64: val, Valid: true})
+		}
+		return r, nil
+	case ddl.Float32:
+		var a []interface{}
+		var r []spanner.NullFloat32
+		err := json.Unmarshal([]byte(v), &a)
+		if err != nil {
+			return []spanner.NullFloat32{}, err
+		}
+		for _, s := range a {
+			if s == "NULL" {
+				r = append(r, spanner.NullFloat32{Valid: false})
+				continue
+			}
+			val, err := convFloat32(fmt.Sprint(s))
+			if err != nil {
+				return []spanner.NullFloat32{}, err
+			}
+			r = append(r, spanner.NullFloat32{Float32: val, Valid: true})
 		}
 		return r, nil
 	case ddl.Float64:

@@ -17,23 +17,26 @@ package utilities
 import (
 	"fmt"
 	"reflect"
+	"strings"
+
 	"time"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
 )
 
-const metadataDbName string = "harbourbridge_metadata"
+func InitObjectId() {
 
-func GetMetadataDbName() string {
-	return metadataDbName
+	sessionState := session.GetSessionState()
+	sessionState.Counter.ObjectId = "0"
 }
 
 func GetSpannerUri(projectId string, instanceId string) string {
-	return fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectId, instanceId, GetMetadataDbName())
+	return fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectId, instanceId, constants.METADATA_DB)
 }
 
 // DuplicateInArray checks if there is any duplicate element present in the list.
@@ -95,6 +98,16 @@ func RemoveSchemaIssue(schemaissue []internal.SchemaIssue, issue internal.Schema
 	return schemaissue[0:k]
 }
 
+// Removes only the first occurance of SchemaIssue from given list
+func RemoveSchemaIssueOnlyOnce(schemaissue []internal.SchemaIssue, issue internal.SchemaIssue) []internal.SchemaIssue {
+	for i, v := range schemaissue {
+		if v == issue {
+			return append(schemaissue[:i], schemaissue[i+1:]...)
+		}
+	}
+	return schemaissue
+}
+
 // IsSchemaIssuePresent checks if issue is present in the given schemaissue list.
 func IsSchemaIssuePresent(schemaissue []internal.SchemaIssue, issue internal.SchemaIssue) bool {
 
@@ -120,6 +133,10 @@ func RemoveSchemaIssues(schemaissue []internal.SchemaIssue) []internal.SchemaIss
 		schemaissue = RemoveSchemaIssue(schemaissue, internal.HotspotTimestamp)
 		fallthrough
 
+	case IsSchemaIssuePresent(schemaissue, internal.UniqueIndexPrimaryKey):
+		schemaissue = RemoveSchemaIssue(schemaissue, internal.UniqueIndexPrimaryKey)
+		fallthrough
+
 	case IsSchemaIssuePresent(schemaissue, internal.InterleavedOrder):
 		schemaissue = RemoveSchemaIssue(schemaissue, internal.InterleavedOrder)
 
@@ -133,15 +150,19 @@ func RemoveSchemaIssues(schemaissue []internal.SchemaIssue) []internal.SchemaIss
 
 	case IsSchemaIssuePresent(schemaissue, internal.InterleavedRenameColumn):
 		schemaissue = RemoveSchemaIssue(schemaissue, internal.InterleavedRenameColumn)
+		fallthrough
+
+	case IsSchemaIssuePresent(schemaissue, internal.InterleavedChangeColumnSize):
+		schemaissue = RemoveSchemaIssue(schemaissue, internal.InterleavedChangeColumnSize)
 	}
 
 	return schemaissue
 }
 
 // RemoveIndex removes Primary Key from the given Primary Key list.
-func RemoveIndex(Pks []ddl.IndexKey, index int) []ddl.IndexKey {
+func RemoveIndex(PrimaryKeys []ddl.IndexKey, index int) []ddl.IndexKey {
 
-	list := append(Pks[:index], Pks[index+1:]...)
+	list := append(PrimaryKeys[:index], PrimaryKeys[index+1:]...)
 
 	return list
 }
@@ -151,23 +172,21 @@ func RemoveFkReferColumns(slice []string, s int) []string {
 	return append(slice[:s], slice[s+1:]...)
 }
 
-func IsTypeChanged(newType, table, colName string, conv *internal.Conv) (bool, error) {
+func IsTypeChanged(newType, tableId, colId string, conv *internal.Conv) (bool, error) {
 
-	srcTableName := conv.ToSource[table].Name
-
-	sp, ty, err := GetType(conv, newType, table, colName, srcTableName)
+	sp, ty, err := GetType(conv, newType, tableId, colId)
 	if err != nil {
 		return false, err
 	}
-	colDef := sp.ColDefs[colName]
+	colDef := sp.ColDefs[colId]
 	return !reflect.DeepEqual(colDef.T, ty), nil
 }
 
 func IsPartOfPK(col, table string) bool {
 	sessionState := session.GetSessionState()
 
-	for _, pk := range sessionState.Conv.SpSchema[table].Pks {
-		if pk.Col == col {
+	for _, pk := range sessionState.Conv.SpSchema[table].PrimaryKeys {
+		if pk.ColId == col {
 			return true
 		}
 	}
@@ -179,7 +198,7 @@ func IsPartOfSecondaryIndex(col, table string) (bool, string) {
 
 	for _, index := range sessionState.Conv.SpSchema[table].Indexes {
 		for _, key := range index.Keys {
-			if key.Col == col {
+			if key.ColId == col {
 				return true, index.Name
 			}
 		}
@@ -190,8 +209,8 @@ func IsPartOfSecondaryIndex(col, table string) (bool, string) {
 func IsPartOfFK(col, table string) bool {
 	sessionState := session.GetSessionState()
 
-	for _, fk := range sessionState.Conv.SpSchema[table].Fks {
-		for _, column := range fk.Columns {
+	for _, fk := range sessionState.Conv.SpSchema[table].ForeignKeys {
+		for _, column := range fk.ColIds {
 			if column == col {
 				return true
 			}
@@ -205,9 +224,9 @@ func IsReferencedByFK(col, table string) (bool, string) {
 
 	for _, spSchema := range sessionState.Conv.SpSchema {
 		if table != spSchema.Name {
-			for _, fk := range spSchema.Fks {
-				if fk.ReferTable == table {
-					for _, column := range fk.ReferColumns {
+			for _, fk := range spSchema.ForeignKeys {
+				if fk.ReferTableId == table {
+					for _, column := range fk.ReferColumnIds {
 						if column == col {
 							return true, spSchema.Name
 						}
@@ -227,15 +246,38 @@ func RemovePk(slice []ddl.IndexKey, s int) []ddl.IndexKey {
 	return append(slice[:s], slice[s+1:]...)
 }
 
-func RemoveFk(slice []ddl.Foreignkey, fkId string) []ddl.Foreignkey {
+func RemoveFk(slice []ddl.Foreignkey, fkId string, srcSchema schema.Table, tableId string) ([]ddl.Foreignkey, error) {
+	sessionState := session.GetSessionState()
+	tableIssues := sessionState.Conv.SchemaIssues[tableId].TableLevelIssues
+
 	pos := -1
 	for i, fk := range slice {
 		if fk.Id == fkId {
 			pos = i
+
+			// Remove foreign key action conversion warnings for dropped FK
+			//
+			// Issues ForeignKeyOnDelete and ForeignKeyOnUpdate might be added to SchemaIssues[tableId] multiple times
+			// due to existance of multiple FKs. We only delete one instance of these issues to maintain
+			// correct warnings for other FKs
+			srcFk, err := internal.GetSrcFkFromId(srcSchema.ForeignKeys, fk.Id)
+			if err != nil {
+				return nil, err
+			}
+			if srcFk.OnDelete != fk.OnDelete {
+				tableIssues = RemoveSchemaIssueOnlyOnce(tableIssues, internal.ForeignKeyOnDelete)
+			}
+			if srcFk.OnUpdate != fk.OnUpdate {
+				tableIssues = RemoveSchemaIssueOnlyOnce(tableIssues, internal.ForeignKeyOnUpdate)
+			}
+			if issues, ok := sessionState.Conv.SchemaIssues[tableId]; ok {
+				issues.TableLevelIssues = tableIssues
+				sessionState.Conv.SchemaIssues[tableId] = issues
+			}
 			break
 		}
 	}
-	return append(slice[:pos], slice[pos+1:]...)
+	return append(slice[:pos], slice[pos+1:]...), nil
 }
 
 func RemoveSecondaryIndex(slice []ddl.CreateIndex, s int) []ddl.CreateIndex {
@@ -267,7 +309,7 @@ func CheckSpannerNamesValidity(input []string) (bool, []string) {
 func CanRename(names []string, table string) (bool, error) {
 	sessionState := session.GetSessionState()
 	for _, name := range names {
-		if _, ok := sessionState.Conv.UsedNames[name]; ok {
+		if _, ok := sessionState.Conv.UsedNames[strings.ToLower(name)]; ok {
 			return false, fmt.Errorf("new name : '%s' is used by another entity", name)
 		}
 	}
@@ -284,36 +326,112 @@ func GetPrimaryKeyIndexFromOrder(pk []ddl.IndexKey, order int) int {
 	return -1
 }
 
+func GetRefColIndexFromFk(fk ddl.Foreignkey, colId string) int {
+	for i, id := range fk.ReferColumnIds {
+		if colId == id {
+			return i
+		}
+	}
+	return -1
+}
+
 func GetFilePrefix(now time.Time) (string, error) {
 	sessionState := session.GetSessionState()
 
 	dbName := sessionState.DbName
 	var err error
 	if dbName == "" {
-		dbName, err = utils.GetDatabaseName(sessionState.Driver, now)
+		g := utils.GetUtilInfoImpl{}
+		dbName, err = g.GetDatabaseName(sessionState.Driver, now)
 		if err != nil {
 			return "", fmt.Errorf("Can not create database name : %v", err)
 		}
 	}
-	return dbName + ".", nil
+	return dbName, nil
 }
 
-
-func UpdateDataType(conv *internal.Conv, newType, table, colName, srcTableName string) error {
-	sp, ty, err := GetType(conv, newType, table, colName, srcTableName)
+func UpdateDataType(conv *internal.Conv, newType, tableId, colId string) error {
+	sp, ty, err := GetType(conv, newType, tableId, colId)
 	if err != nil {
 		return err
 	}
-	colDef := sp.ColDefs[colName]
+	colDef := sp.ColDefs[colId]
 	colDef.T = ty
-	sp.ColDefs[colName] = colDef
+	sp.ColDefs[colId] = colDef
 	return nil
 }
 
-func GetInterleavedFk(conv *internal.Conv, srcTableName string, srcCol string) (schema.ForeignKey, error) {
-	for _, fk := range conv.SrcSchema[srcTableName].ForeignKeys {
-		for _, col := range fk.Columns {
-			if srcCol == col {
+// Update the column length with the default mapping length in case its same as the length in the rule added
+func updateColLen(conv *internal.Conv, dataType, tableId, colId string, spColLen int64) error {
+	sp, ty, err := GetType(conv, dataType, tableId, colId)
+	if err != nil {
+		return err
+	}
+	colDef := sp.ColDefs[colId]
+	if colDef.T.Len == spColLen {
+		colDef.T.Len = ty.Len
+		sp.ColDefs[colId] = colDef
+	}
+	return nil
+}
+
+func UpdateMaxColumnLen(conv *internal.Conv, dataType, tableId, colId string, spColLen int64) error {
+
+	err := updateColLen(conv, dataType, tableId, colId, spColLen)
+	if err != nil {
+		return err
+	}
+	sp := conv.SpSchema[tableId]
+	// update column size of child table.
+	isParent, childTableId := IsParent(tableId)
+	if isParent {
+		childColId, err := GetColIdFromSpannerName(conv, childTableId, sp.ColDefs[colId].Name)
+		if err == nil {
+			err = updateColLen(conv, dataType, childTableId, childColId, spColLen)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// update column size of parent table.
+	parentTableId := conv.SpSchema[tableId].ParentTable.Id
+	if parentTableId != "" {
+		parentColId, err := GetColIdFromSpannerName(conv, parentTableId, sp.ColDefs[colId].Name)
+		if err == nil {
+			err = updateColLen(conv, dataType, parentTableId, parentColId, spColLen)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func GetColIdFromSpannerName(conv *internal.Conv, tableId, colName string) (string, error) {
+	for _, col := range conv.SpSchema[tableId].ColDefs {
+		if col.Name == colName {
+			return col.Id, nil
+		}
+	}
+	return "", fmt.Errorf("column id not found for spaner column %v", colName)
+}
+
+func IsParent(tableId string) (bool, string) {
+	sessionState := session.GetSessionState()
+
+	for _, spSchema := range sessionState.Conv.SpSchema {
+		if spSchema.ParentTable.Id == tableId {
+			return true, spSchema.Id
+		}
+	}
+	return false, ""
+}
+
+func GetInterleavedFk(conv *internal.Conv, tableId string, srcColId string) (schema.ForeignKey, error) {
+	for _, fk := range conv.SrcSchema[tableId].ForeignKeys {
+		for _, colId := range fk.ColIds {
+			if srcColId == colId {
 				return fk, nil
 			}
 		}

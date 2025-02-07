@@ -15,9 +15,14 @@
 package table
 
 import (
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
+	"fmt"
+	"regexp"
+
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
 )
 
 const (
@@ -26,10 +31,10 @@ const (
 )
 
 // IsColumnPresentInColNames check column is present in colnames.
-func IsColumnPresentInColNames(colNames []string, columnName string) bool {
+func IsColumnPresentInColNames(colIds []string, colId string) bool {
 
-	for _, column := range colNames {
-		if column == columnName {
+	for _, id := range colIds {
+		if id == colId {
 			return true
 		}
 	}
@@ -38,22 +43,22 @@ func IsColumnPresentInColNames(colNames []string, columnName string) bool {
 }
 
 // GetSpannerTableDDL return Spanner Table DDL as string.
-func GetSpannerTableDDL(spannerTable ddl.CreateTable) string {
+func GetSpannerTableDDL(spannerTable ddl.CreateTable, spDialect string, driver string) string {
+	sessionState := session.GetSessionState()
+	c := ddl.Config{Comments: true, ProtectIds: false, SpDialect: spDialect, Source: driver}
 
-	c := ddl.Config{Comments: true, ProtectIds: false}
-
-	ddl := spannerTable.PrintCreateTable(c)
+	ddl := spannerTable.PrintCreateTable(sessionState.Conv.SpSchema, c)
 
 	return ddl
 }
 
-func renameInterleaveTableSchema(interleaveTableSchema []InterleaveTableSchema, table string, columnId string, colName string, newName string) []InterleaveTableSchema {
+func renameInterleaveTableSchema(interleaveTableSchema []InterleaveTableSchema, tableName, colId, oldName, newName, colType string, colSize int) []InterleaveTableSchema {
 
-	tableIndex := isTablePresent(interleaveTableSchema, table)
+	tableIndex := isTablePresent(interleaveTableSchema, tableName)
 
-	interleaveTableSchema = createInterleaveTableSchema(interleaveTableSchema, table, tableIndex)
+	interleaveTableSchema = createInterleaveTableSchema(interleaveTableSchema, tableName, tableIndex)
 
-	interleaveTableSchema = renameInterleaveColumn(interleaveTableSchema, table, columnId, colName, newName)
+	interleaveTableSchema = renameInterleaveColumn(interleaveTableSchema, tableName, colId, oldName, newName, colType, colSize)
 
 	return interleaveTableSchema
 }
@@ -82,26 +87,26 @@ func createInterleaveTableSchema(interleaveTableSchema []InterleaveTableSchema, 
 	return interleaveTableSchema
 }
 
-func renameInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, newName string) []InterleaveTableSchema {
-
+func renameInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, newName, colType string, colSize int) []InterleaveTableSchema {
 	tableIndex := isTablePresent(interleaveTableSchema, table)
 
 	colIndex := isColumnPresent(interleaveTableSchema[tableIndex].InterleaveColumnChanges, columnId)
 
-	interleaveTableSchema = createInterleaveColumn(interleaveTableSchema, tableIndex, colIndex, columnId, colName, newName)
+	interleaveTableSchema = createInterleaveColumn(interleaveTableSchema, tableIndex, colIndex, columnId, colName, newName, colType, colSize)
 
 	if tableIndex != -1 && colIndex != -1 {
 		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnId = columnId
 		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnName = colName
 		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].UpdateColumnName = newName
-
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Type = colType
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Size = colSize
 	}
 
 	return interleaveTableSchema
 
 }
 
-func createInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, tableIndex int, colIndex int, columnId string, colName string, newName string) []InterleaveTableSchema {
+func createInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, tableIndex int, colIndex int, columnId, colName, newName, colType string, colSize int) []InterleaveTableSchema {
 
 	if colIndex == -1 {
 
@@ -111,6 +116,8 @@ func createInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, table
 			interleaveColumn.ColumnId = columnId
 			interleaveColumn.ColumnName = colName
 			interleaveColumn.UpdateColumnName = newName
+			interleaveColumn.Type = colType
+			interleaveColumn.Size = colSize
 
 			interleaveTableSchema[tableIndex].InterleaveColumnChanges = append(interleaveTableSchema[tableIndex].InterleaveColumnChanges, interleaveColumn)
 		}
@@ -130,33 +137,62 @@ func isColumnPresent(interleaveColumn []InterleaveColumn, columnId string) int {
 	return -1
 }
 
-func updateTypeOfInterleaveTableSchema(interleaveTableSchema []InterleaveTableSchema, table string, columnId string, colName string, previousType string, updateType string) []InterleaveTableSchema {
+func updateTypeOfInterleaveTableSchema(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, previousType, updateType string, previousSize, newSize int) []InterleaveTableSchema {
 
 	tableIndex := isTablePresent(interleaveTableSchema, table)
 
 	interleaveTableSchema = createInterleaveTableSchema(interleaveTableSchema, table, tableIndex)
 
-	interleaveTableSchema = updateTypeOfInterleaveColumn(interleaveTableSchema, table, columnId, colName, previousType, updateType)
+	interleaveTableSchema = updateTypeOfInterleaveColumn(interleaveTableSchema, table, columnId, colName, previousType, updateType, previousSize, newSize)
 	return interleaveTableSchema
 }
 
-func updateTypeOfInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, previousType, updateType string) []InterleaveTableSchema {
+func updateTypeOfInterleaveColumn(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, previousType, updateType string, previousSize, newSize int) []InterleaveTableSchema {
 
 	tableIndex := isTablePresent(interleaveTableSchema, table)
 	colIndex := isColumnPresent(interleaveTableSchema[tableIndex].InterleaveColumnChanges, columnId)
-	interleaveTableSchema = createInterleaveColumnType(interleaveTableSchema, tableIndex, colIndex, columnId, colName, previousType, updateType)
+	interleaveTableSchema = createInterleaveColumnType(interleaveTableSchema, tableIndex, colIndex, columnId, colName, previousType, updateType, previousSize, newSize)
 
 	if tableIndex != -1 && colIndex != -1 {
 		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnId = columnId
-		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnName = colName
+		if interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnName == "" {
+			interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnName = colName
+		}
 		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Type = previousType
 		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].UpdateType = updateType
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Size = previousSize
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].UpdateSize = newSize
 	}
 
 	return interleaveTableSchema
 }
 
-func createInterleaveColumnType(interleaveTableSchema []InterleaveTableSchema, tableIndex int, colIndex int, columnId string, colName string, previousType string, updateType string) []InterleaveTableSchema {
+func updateInterleaveTableSchemaForChangeInSize(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, colType string, previousSize, newSize int) []InterleaveTableSchema {
+	tableIndex := isTablePresent(interleaveTableSchema, table)
+	interleaveTableSchema = createInterleaveTableSchema(interleaveTableSchema, table, tableIndex)
+	interleaveTableSchema = updateInterleaveColumnForChangeInSize(interleaveTableSchema, table, columnId, colName, colType, previousSize, newSize)
+	return interleaveTableSchema
+}
+
+func updateInterleaveColumnForChangeInSize(interleaveTableSchema []InterleaveTableSchema, table, columnId, colName, colType string, previousSize, newSize int) []InterleaveTableSchema {
+	tableIndex := isTablePresent(interleaveTableSchema, table)
+	colIndex := isColumnPresent(interleaveTableSchema[tableIndex].InterleaveColumnChanges, columnId)
+	interleaveTableSchema = createInterleaveColumnType(interleaveTableSchema, tableIndex, colIndex, columnId, colName, colType, colType, previousSize, newSize)
+	if tableIndex != -1 && colIndex != -1 {
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnId = columnId
+		if interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnName == "" {
+			interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].ColumnName = colName
+		}
+		if interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Type == "" {
+			interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Type = colType
+		}
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].Size = previousSize
+		interleaveTableSchema[tableIndex].InterleaveColumnChanges[colIndex].UpdateSize = newSize
+	}
+	return interleaveTableSchema
+}
+
+func createInterleaveColumnType(interleaveTableSchema []InterleaveTableSchema, tableIndex int, colIndex int, columnId, colName, previousType, updateType string, previousSize, newSize int) []InterleaveTableSchema {
 
 	if colIndex == -1 {
 		if columnId != "" {
@@ -165,6 +201,8 @@ func createInterleaveColumnType(interleaveTableSchema []InterleaveTableSchema, t
 			interleaveColumn.ColumnName = colName
 			interleaveColumn.Type = previousType
 			interleaveColumn.UpdateType = updateType
+			interleaveColumn.Size = previousSize
+			interleaveColumn.UpdateSize = newSize
 			interleaveTableSchema[tableIndex].InterleaveColumnChanges = append(interleaveTableSchema[tableIndex].InterleaveColumnChanges, interleaveColumn)
 		}
 	}
@@ -184,45 +222,153 @@ func trimRedundantInterleaveTableSchema(interleaveTableSchema []InterleaveTableS
 
 func updateInterleaveTableSchema(conv *internal.Conv, interleaveTableSchema []InterleaveTableSchema) []InterleaveTableSchema {
 	for k, v := range interleaveTableSchema {
-		table := v.Table
 		for ind, col := range v.InterleaveColumnChanges {
 			if col.UpdateColumnName == "" {
 				interleaveTableSchema[k].InterleaveColumnChanges[ind].UpdateColumnName = col.ColumnName
 			}
-			if col.Type == "" {
-				interleaveTableSchema[k].InterleaveColumnChanges[ind].Type = conv.SpSchema[table].ColDefs[col.UpdateColumnName].T.Name
-			}
 			if col.UpdateType == "" {
-				interleaveTableSchema[k].InterleaveColumnChanges[ind].UpdateType = conv.SpSchema[table].ColDefs[col.UpdateColumnName].T.Name
+				interleaveTableSchema[k].InterleaveColumnChanges[ind].UpdateType = col.Type
+			}
+			if col.UpdateSize == 0 {
+				interleaveTableSchema[k].InterleaveColumnChanges[ind].UpdateSize = col.Size
 			}
 		}
 	}
 	return interleaveTableSchema
 }
 
-func UpdateNotNull(notNullChange, table, colName string, conv *internal.Conv) {
+func UpdateNotNull(notNullChange, tableId, colId string, conv *internal.Conv) {
 
-	sp := conv.SpSchema[table]
+	sp := conv.SpSchema[tableId]
 
 	switch notNullChange {
 	case NotNullAdded:
-		spColDef := sp.ColDefs[colName]
+		spColDef := sp.ColDefs[colId]
 		spColDef.NotNull = true
-		sp.ColDefs[colName] = spColDef
+		sp.ColDefs[colId] = spColDef
 	case NotNullRemoved:
-		spColDef := sp.ColDefs[colName]
+		spColDef := sp.ColDefs[colId]
 		spColDef.NotNull = false
-		sp.ColDefs[colName] = spColDef
+		sp.ColDefs[colId] = spColDef
 	}
 }
 
-func IsParent(table string) (bool, string) {
-	sessionState := session.GetSessionState()
+func UpdateAutoGenCol(autoGen ddl.AutoGenCol, tableId, colId string, conv *internal.Conv) map[string]ddl.Sequence {
+	sp := conv.SpSchema[tableId]
+	sequences := conv.SpSequences
+	spColDef := sp.ColDefs[colId]
+	if spColDef.AutoGen.GenerationType == constants.SEQUENCE {
+		seqId := getSequenceId(spColDef.AutoGen.Name, conv.SpSequences)
+		sequences = deleteColumnFromSequence(seqId, tableId, colId, sequences)
+	}
+	spColDef.AutoGen = autoGen
+	sp.ColDefs[colId] = spColDef
+	if autoGen.GenerationType == constants.SEQUENCE {
+		seqId := getSequenceId(autoGen.Name, conv.SpSequences)
+		sequences = addColumnToSequence(seqId, tableId, colId, sequences)
+	}
+	conv.SpSchema[tableId] = sp
+	return sequences
+}
 
-	for _, spSchema := range sessionState.Conv.SpSchema {
-		if spSchema.Parent == table {
-			return true, spSchema.Name
+func getFkColumnPosition(colIds []string, colId string) int {
+	for i, id := range colIds {
+		if colId == id {
+			return i
 		}
 	}
-	return false, ""
+	return -1
+}
+
+func isColFistOderPk(pks []ddl.IndexKey, colId string) bool {
+	for _, pk := range pks {
+		if pk.ColId == colId && pk.Order == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func deleteColumnFromSequence(sequenceId string, tableId, colId string, sequences map[string]ddl.Sequence) map[string]ddl.Sequence {
+	if _, ok := sequences[sequenceId].ColumnsUsingSeq[tableId]; ok {
+		cols := sequences[sequenceId].ColumnsUsingSeq[tableId]
+		for i, col := range cols {
+			if col == colId {
+				sequences[sequenceId].ColumnsUsingSeq[tableId] = append(cols[:i], cols[i+1:]...)
+				return sequences
+			}
+		}
+	}
+	return sequences
+}
+
+func addColumnToSequence(sequenceId string, tableId, colId string, sequences map[string]ddl.Sequence) map[string]ddl.Sequence {
+	if _, ok := sequences[sequenceId].ColumnsUsingSeq[tableId]; ok {
+		cols := sequences[sequenceId].ColumnsUsingSeq[tableId]
+		found := false
+		for _, c := range cols {
+			if c == colId {
+				found = true
+				fmt.Println(found)
+				return sequences
+			}
+		}
+		if !found {
+			sequences[sequenceId].ColumnsUsingSeq[tableId] = append(cols, colId)
+			return sequences
+		}
+	} else {
+		cols := []string{colId}
+		seq := sequences[sequenceId]
+		if seq.ColumnsUsingSeq == nil {
+			seq.ColumnsUsingSeq = make(map[string][]string)
+		}
+		seq.ColumnsUsingSeq[tableId] = cols
+		sequences[sequenceId] = seq
+	}
+	return sequences
+}
+
+func getSequenceId(sequenceName string, spSeq map[string]ddl.Sequence) string {
+	for seqId, seq := range spSeq {
+		if seq.Name == sequenceName {
+			return seqId
+		}
+	}
+	return ""
+}
+
+// Add, deletes and updates default value associated with a column during edit column functionality
+func UpdateDefaultValue(dv ddl.DefaultValue, tableId, colId string, conv *internal.Conv) {
+	col := conv.SpSchema[tableId].ColDefs[colId]
+	if !dv.IsPresent {
+		col.DefaultValue = ddl.DefaultValue{}
+		conv.SpSchema[tableId].ColDefs[colId] = col
+		return
+	}
+
+	var expressionId string
+	if dv.Value.ExpressionId == "" {
+		if _, exists := conv.SrcSchema[tableId]; exists {
+			if column, exists := conv.SrcSchema[tableId].ColDefs[colId]; exists {
+				if column.DefaultValue.Value.ExpressionId != "" {
+					expressionId = column.DefaultValue.Value.ExpressionId
+				}
+			}
+		}
+		if expressionId == "" {
+			expressionId = internal.GenerateExpressionId()
+		}
+	} else {
+		expressionId = dv.Value.ExpressionId
+	}
+	re := regexp.MustCompile(`\([^)]*\)`)
+	col.DefaultValue = ddl.DefaultValue{
+		Value: ddl.Expression{
+			ExpressionId: expressionId,
+			Statement:    common.SanitizeDefaultValue(dv.Value.Statement, col.T.Name, re.MatchString(dv.Value.Statement)),
+		},
+		IsPresent: true,
+	}
+	conv.SpSchema[tableId].ColDefs[colId] = col
 }

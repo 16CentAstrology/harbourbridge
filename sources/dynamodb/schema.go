@@ -28,10 +28,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"github.com/aws/aws-sdk-go/service/dynamodbstreams/dynamodbstreamsiface"
 
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 const (
@@ -93,11 +93,12 @@ func (isi InfoSchemaImpl) GetColumns(conv *internal.Conv, table common.SchemaAnd
 }
 
 func (isi InfoSchemaImpl) GetRowsFromTable(conv *internal.Conv, srcTable string) (interface{}, error) {
+	srcTableName := conv.SrcSchema[srcTable].Name
 	var lastEvaluatedKey map[string]*dynamodb.AttributeValue
 	for {
 		// Build the query input parameters.
 		params := &dynamodb.ScanInput{
-			TableName: aws.String(srcTable),
+			TableName: aws.String(srcTableName),
 		}
 		if lastEvaluatedKey != nil {
 			params.ExclusiveStartKey = lastEvaluatedKey
@@ -106,7 +107,7 @@ func (isi InfoSchemaImpl) GetRowsFromTable(conv *internal.Conv, srcTable string)
 		// Make the DynamoDB Query API call.
 		result, err := isi.DynamoClient.Scan(params)
 		if err != nil {
-			return nil, fmt.Errorf("failed to make Query API call for table %v: %v", srcTable, err)
+			return nil, fmt.Errorf("failed to make Query API call for table %v: %v", srcTableName, err)
 		}
 
 		if result.LastEvaluatedKey == nil {
@@ -128,27 +129,27 @@ func (isi InfoSchemaImpl) GetRowCount(table common.SchemaAndName) (int64, error)
 	return *result.Table.ItemCount, err
 }
 
-func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.SchemaAndName) (primaryKeys []string, constraints map[string][]string, err error) {
+func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.SchemaAndName) (primaryKeys []string, checkConstraints []schema.CheckConstraint, constraints map[string][]string, err error) {
 	input := &dynamodb.DescribeTableInput{
 		TableName: aws.String(table.Name),
 	}
 	result, err := isi.DynamoClient.DescribeTable(input)
 	if err != nil {
-		return primaryKeys, constraints, fmt.Errorf("failed to make a DescribeTable API call for table %v: %v", table.Name, err)
+		return primaryKeys, checkConstraints, constraints, fmt.Errorf("failed to make a DescribeTable API call for table %v: %v", table.Name, err)
 	}
 
 	// Primary keys.
 	for _, i := range result.Table.KeySchema {
 		primaryKeys = append(primaryKeys, *i.AttributeName)
 	}
-	return primaryKeys, constraints, nil
+	return primaryKeys, checkConstraints, constraints, nil
 }
 
 func (isi InfoSchemaImpl) GetForeignKeys(conv *internal.Conv, table common.SchemaAndName) (foreignKeys []schema.ForeignKey, err error) {
 	return foreignKeys, err
 }
 
-func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAndName) (indexes []schema.Index, err error) {
+func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAndName, colNameIdMap map[string]string) (indexes []schema.Index, err error) {
 	input := &dynamodb.DescribeTableInput{
 		TableName: aws.String(table.Name),
 	}
@@ -165,12 +166,12 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 
 	// Convert secondary indexes from GlobalSecondaryIndexes.
 	for _, i := range result.Table.GlobalSecondaryIndexes {
-		indexes = append(indexes, getSchemaIndexStruct(*i.IndexName, i.KeySchema))
+		indexes = append(indexes, getSchemaIndexStruct(*i.IndexName, i.KeySchema, colNameIdMap))
 	}
 
 	// Convert secondary indexes from LocalSecondaryIndexes.
 	for _, i := range result.Table.LocalSecondaryIndexes {
-		indexes = append(indexes, getSchemaIndexStruct(*i.IndexName, i.KeySchema))
+		indexes = append(indexes, getSchemaIndexStruct(*i.IndexName, i.KeySchema, colNameIdMap))
 	}
 	return indexes, nil
 }
@@ -180,15 +181,15 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 // on the source and Spanner schemas), and write it to Spanner. If we can't
 // get/process data for a table, we skip that table and process the remaining
 // tables.
-func (isi InfoSchemaImpl) ProcessData(conv *internal.Conv, srcTable string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable) error {
-	rows, err := isi.GetRowsFromTable(conv, srcTable)
+func (isi InfoSchemaImpl) ProcessData(conv *internal.Conv, tableId string, srcSchema schema.Table, colIds []string, spSchema ddl.CreateTable, additionalAttributes internal.AdditionalDataAttributes) error {
+	rows, err := isi.GetRowsFromTable(conv, tableId)
 	if err != nil {
-		conv.Unexpected(fmt.Sprintf("Couldn't get data for table %s : err = %s", srcTable, err))
+		conv.Unexpected(fmt.Sprintf("Couldn't get data for table %s : err = %s", conv.SrcSchema[tableId].Name, err))
 		return err
 	}
 	// Iterate the items returned.
 	for _, attrsMap := range rows.([]map[string]*dynamodb.AttributeValue) {
-		ProcessDataRow(attrsMap, conv, srcTable, srcSchema, spTable, spCols, spSchema)
+		ProcessDataRow(attrsMap, conv, tableId, srcSchema, colIds, spSchema)
 	}
 	return nil
 }
@@ -199,10 +200,10 @@ func (isi InfoSchemaImpl) StartChangeDataCapture(ctx context.Context, conv *inte
 	fmt.Println("Starting DynamoDB Streams initialization...")
 
 	latestStreamArn := make(map[string]interface{})
-	orderTableNames := ddl.OrderTables(conv.SpSchema)
+	tableIds := ddl.GetSortedTableIdsBySpName(conv.SpSchema)
 
-	for _, spannerTable := range orderTableNames {
-		srcTable, _ := internal.GetSourceTable(conv, spannerTable)
+	for _, tableId := range tableIds {
+		srcTable := conv.SrcSchema[tableId].Name
 		streamArn, err := NewDynamoDBStream(isi.DynamoClient, srcTable)
 		if err != nil {
 			conv.Unexpected(fmt.Sprintf("Couldn't initialize DynamoDB Stream for table %s: %s", srcTable, err))
@@ -218,7 +219,7 @@ func (isi InfoSchemaImpl) StartChangeDataCapture(ctx context.Context, conv *inte
 // StartStreamingMigration starts the streaming migration process by creating a seperate
 // worker thread/goroutine for each table's DynamoDB Stream. It catches Ctrl+C signal if
 // customer wants to stop the process.
-func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, client *sp.Client, conv *internal.Conv, latestStreamArn map[string]interface{}) error {
+func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, migrationProjectId string, client *sp.Client, conv *internal.Conv, latestStreamArn map[string]interface{}) (internal.DataflowOutput, error) {
 	fmt.Println("Processing of DynamoDB Streams started...")
 	fmt.Println("Use Ctrl+C to stop the process.")
 
@@ -242,15 +243,17 @@ func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, client *s
 	fillConvWithStreamingStats(streamInfo, conv)
 
 	fmt.Println("DynamoDB Streams processed successfully.")
-	return nil
+	return internal.DataflowOutput{}, nil
 }
 
-func getSchemaIndexStruct(indexName string, keySchema []*dynamodb.KeySchemaElement) schema.Index {
+func getSchemaIndexStruct(indexName string, keySchema []*dynamodb.KeySchemaElement, colNameIdMap map[string]string) schema.Index {
 	var keys []schema.Key
 	for _, j := range keySchema {
-		keys = append(keys, schema.Key{Column: *j.AttributeName})
+		keys = append(keys, schema.Key{ColId: colNameIdMap[*j.AttributeName]})
 	}
-	return schema.Index{Name: indexName, Keys: keys}
+	return schema.Index{
+		Id:   internal.GenerateIndexesId(),
+		Name: indexName, Keys: keys}
 }
 
 func scanSampleData(client dynamodbiface.DynamoDBAPI, sampleSize int64, table string) (map[string]map[string]int64, int64, error) {
@@ -347,7 +350,7 @@ type statItem struct {
 
 func inferDataTypes(stats map[string]map[string]int64, rows int64, primaryKeys []string) (map[string]schema.Column, []string, error) {
 	colDefs := make(map[string]schema.Column)
-	var colNames []string
+	var colIds []string
 
 	for col, countMap := range stats {
 		var statItems, candidates []statItem
@@ -390,20 +393,21 @@ func inferDataTypes(stats map[string]map[string]int64, rows int64, primaryKeys [
 			}
 		}
 
-		colNames = append(colNames, col)
+		colId := internal.GenerateColumnId()
+		colIds = append(colIds, colId)
 		if len(candidates) == 1 {
-			colDefs[col] = schema.Column{Name: col, Type: schema.Type{Name: candidates[0].Type}, NotNull: !nullable}
+			colDefs[colId] = schema.Column{Id: colId, Name: col, Type: schema.Type{Name: candidates[0].Type}, NotNull: !nullable}
 		} else {
 			// If there is no any candidate or more than a single candidate,
 			// this column has a significant conflict on data types and then
 			// defaults to a String type.
-			colDefs[col] = schema.Column{Name: col, Type: schema.Type{Name: typeString}, NotNull: !nullable}
+			colDefs[colId] = schema.Column{Id: colId, Name: col, Type: schema.Type{Name: typeString}, NotNull: !nullable}
 		}
 	}
 	// Sort column names in increasing order, because the server may return them
 	// in a random order.
-	sort.Strings(colNames)
-	return colDefs, colNames, nil
+	sort.Strings(colIds)
+	return colDefs, colIds, nil
 }
 
 // numericParsable determines whether its argument is a valid Spanner numeric

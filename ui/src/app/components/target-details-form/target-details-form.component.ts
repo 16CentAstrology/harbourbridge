@@ -12,6 +12,7 @@ export class TargetDetailsFormComponent implements OnInit {
   targetDetailsForm: FormGroup
   region: string = ''
   spannerInstance: string = ''
+  dialect: string = ''
 
   constructor(
     private formBuilder: FormBuilder,
@@ -20,13 +21,12 @@ export class TargetDetailsFormComponent implements OnInit {
   ) {
     this.region = data.Region
     this.spannerInstance = data.Instance
+    this.dialect = data.Dialect
     this.targetDetailsForm = this.formBuilder.group({
-      targetDb: ['', Validators.required],
-      dialect: ['', Validators.required],
+      targetDb: ['', [Validators.required,Validators.pattern('^[a-z][a-z0-9-_]{0,28}[a-z0-9]$')]],
     })
     this.targetDetailsForm.setValue({
       targetDb: localStorage.getItem(TargetDetails.TargetDB),
-      dialect: localStorage.getItem(TargetDetails.Dialect)
     })
   }
 
