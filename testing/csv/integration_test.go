@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cloudspannerecosystem/harbourbridge/testing/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/testing/common"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 
@@ -48,7 +48,8 @@ var (
 )
 
 const (
-	ALL_TYPES_CSV string = "all_data_types.csv"
+	ALL_TYPES_CSV      string = "all_data_types.csv"
+	MANIFEST_FILE_NAME string = "csv_manifest.json"
 )
 
 type SpannerRecord struct {
@@ -73,8 +74,8 @@ func TestMain(m *testing.M) {
 }
 
 func initIntegrationTests() (cleanup func()) {
-	projectID = os.Getenv("HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID")
-	instanceID = os.Getenv("HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID")
+	projectID = os.Getenv("SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID")
+	instanceID = os.Getenv("SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID")
 
 	ctx = context.Background()
 	flag.Parse() // Needed for testing.Short().
@@ -86,12 +87,12 @@ func initIntegrationTests() (cleanup func()) {
 	}
 
 	if projectID == "" {
-		log.Println("Integration tests skipped: HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID is missing")
+		log.Println("Integration tests skipped: SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID is missing")
 		return noop
 	}
 
 	if instanceID == "" {
-		log.Println("Integration tests skipped: HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID is missing")
+		log.Println("Integration tests skipped: SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID is missing")
 		return noop
 	}
 
@@ -162,16 +163,20 @@ func TestIntegration_CSV_Command(t *testing.T) {
 	dbName := "csv-test"
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
 
+	writeManifestFile(t)
 	writeCSVs(t)
 	defer cleanupCSVs()
+	defer cleanupManifest()
+
+	// Drop the database later.
+	defer dropDatabase(t, dbURI)
+
 	createSpannerSchema(t, projectID, instanceID, dbName)
-	args := fmt.Sprintf("data -source=csv -target-profile='instance=%s,dbName=%s'", instanceID, dbName)
+	args := fmt.Sprintf("data -source=csv -source-profile=manifest=%s -target-profile='instance=%s,dbName=%s,project=%s'", MANIFEST_FILE_NAME, instanceID, dbName, projectID)
 	err := common.RunCommand(args, projectID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Drop the database later.
-	defer dropDatabase(t, dbURI)
 
 	checkResults(t, dbURI, false)
 }
@@ -204,6 +209,39 @@ func cleanupCSVs() {
 	for _, fn := range []string{ALL_TYPES_CSV} {
 		os.Remove(fn)
 	}
+}
+
+func writeManifestFile(t *testing.T) {
+	f, err := os.Create(MANIFEST_FILE_NAME)
+	if err != nil {
+		t.Fatalf("Could not create %s: %v", MANIFEST_FILE_NAME, err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(`
+	[
+		{
+			"table_name": "all_data_types",
+			"file_patterns": ["all_data_types.csv"],
+			"columns": [
+			{ "column_name": "a", "type_name": "BOOL" },
+			{ "column_name": "b", "type_name": "BYTES" },
+			{ "column_name": "c", "type_name": "DATE" },
+			{ "column_name": "d", "type_name": "FLOAT64" },
+			{ "column_name": "e", "type_name": "INT64" },
+			{ "column_name": "f", "type_name": "NUMERIC" },
+			{ "column_name": "g", "type_name": "STRING" },
+			{ "column_name": "h", "type_name": "TIMESTAMP" },
+			{ "column_name": "i", "type_name": "JSON" }
+			]
+		}
+	]`)
+	if err != nil {
+		t.Fatalf("Could not write to %s: %v", MANIFEST_FILE_NAME, err)
+	}
+}
+
+func cleanupManifest() {
+	os.Remove(MANIFEST_FILE_NAME)
 }
 
 func checkResults(t *testing.T, dbURI string, skipJson bool) {

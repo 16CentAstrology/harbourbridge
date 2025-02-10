@@ -13,17 +13,17 @@
 // limitations under the License.
 
 // Package utils contains common helper functions used across multiple other packages.
-// Utils should not import any harbourbridge packages.
+// Utils should not import any Spanner migration tool packages.
 package utils
 
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/url"
 	"os"
 	"os/exec"
@@ -37,16 +37,22 @@ import (
 	sp "cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
 	instance "cloud.google.com/go/spanner/admin/instance/apiv1"
+	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"cloud.google.com/go/storage"
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/spanner"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/parse"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/expressions_api"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/spanner"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 	"golang.org/x/crypto/ssh/terminal"
-	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
-	instancepb "google.golang.org/genproto/googleapis/spanner/admin/instance/v1"
+)
+
+var (
+	dataflowTemplatePath = constants.DEFAULT_TEMPLATE_PATH
 )
 
 // IOStreams is a struct that contains the file descriptor for dumpFile.
@@ -55,11 +61,21 @@ type IOStreams struct {
 	BytesRead           int64
 }
 
-// Harbourbridge accepts a manifest file in the form of a json which unmarshalls into the ManifestTables struct.
+// Spanner migration tool accepts a manifest file in the form of a json which unmarshalls into the ManifestTables struct.
 type ManifestTable struct {
 	Table_name    string   `json:"table_name"`
 	File_patterns []string `json:"file_patterns"`
 }
+
+// Interface to fetch spanner details
+type GetUtilInfoInterface interface {
+	GetProject() (string, error)
+	GetInstance(ctx context.Context, project string, out *os.File) (string, error)
+	GetPassword() string
+	GetDatabaseName(driver string, now time.Time) (string, error)
+}
+
+type GetUtilInfoImpl struct{}
 
 // NewIOStreams returns a new IOStreams struct such that input stream is set
 // to open file descriptor for dumpFile if driver is PGDUMP or MYSQLDUMP.
@@ -78,7 +94,7 @@ func NewIOStreams(driver string, dumpFile string) IOStreams {
 		if u.Scheme == constants.GCS_SCHEME {
 			bucketName := u.Host
 			filePath := u.Path[1:] // removes "/" from beginning of path
-			f, err = DownloadFromGCS(bucketName, filePath, "harbourbridge.gcs.data")
+			f, err = DownloadFromGCS(bucketName, filePath, "spanner-migration-tool.gcs.data")
 		} else {
 			f, err = os.Open(dumpFile)
 		}
@@ -112,7 +128,7 @@ func DownloadFromGCS(bucketName, filePath, tmpFile string) (*os.File, error) {
 	defer rc.Close()
 	r := bufio.NewReader(rc)
 
-	tmpDir := filepath.Join(os.TempDir(), constants.HB_TMP_DIR)
+	tmpDir := filepath.Join(os.TempDir(), constants.SMT_TMP_DIR)
 	os.MkdirAll(tmpDir, os.ModePerm)
 	tmpfile, err := os.Create(tmpDir + "/" + tmpFile)
 	if err != nil {
@@ -159,7 +175,7 @@ func PreloadGCSFiles(tables []ManifestTable) ([]ManifestTable, error) {
 				filePath := u.Path[1:] // removes "/" from beginning of path
 				tmpFile := strings.ReplaceAll(filePath, "/", ".")
 				// Files get downloaded to tmp dir.
-				fileLoc := filepath.Join(os.TempDir(), constants.HB_TMP_DIR, tmpFile)
+				fileLoc := filepath.Join(os.TempDir(), constants.SMT_TMP_DIR, tmpFile)
 				_, err = DownloadFromGCS(bucketName, filePath, tmpFile)
 				if err != nil {
 					return nil, fmt.Errorf("cannot download gcs file: %s for table %s", filePath, table.Table_name)
@@ -172,83 +188,10 @@ func PreloadGCSFiles(tables []ManifestTable) ([]ManifestTable, error) {
 	return tables, nil
 }
 
-func ParseGCSFilePath(filePath string) (*url.URL, error) {
-	if len(filePath) == 0 {
-		return nil, fmt.Errorf("found empty GCS path")
-	}
-	if filePath[len(filePath)-1] != '/' {
-		filePath = filePath + "/"
-	}
-	u, err := url.Parse(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("parseFilePath: unable to parse file path %s", filePath)
-	}
-	if u.Scheme != constants.GCS_SCHEME {
-		return nil, fmt.Errorf("not a valid GCS path: %s, should start with 'gs'", filePath)
-	}
-	return u, nil
-}
-
-func WriteToGCS(filePath, fileName, data string) error {
-	ctx := context.Background()
-
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		fmt.Printf("Failed to create GCS client")
-		return err
-	}
-	defer client.Close()
-	u, err := ParseGCSFilePath(filePath)
-	if err != nil {
-		return fmt.Errorf("parseFilePath: unable to parse file path: %v", err)
-	}
-	bucketName := u.Host
-	bucket := client.Bucket(bucketName)
-	obj := bucket.Object(u.Path[1:] + fileName)
-
-	w := obj.NewWriter(ctx)
-	if _, err := fmt.Fprint(w, data); err != nil {
-		fmt.Printf("Failed to write to Cloud Storage: %s", filePath)
-		return err
-	}
-	if err := w.Close(); err != nil {
-		fmt.Printf("Failed to close GCS file: %s", filePath)
-		return err
-	}
-	return nil
-}
-
-func CreateGCSBucket(bucketName, projectID string) error {
-	ctx := context.Background()
-
-	client, err := storage.NewClient(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to create GCS client: %v", err)
-	}
-	defer client.Close()
-	bucket := client.Bucket(bucketName)
-	if err := bucket.Create(ctx, projectID, nil); err != nil {
-		if e, ok := err.(*googleapi.Error); ok {
-			// Ignoring the bucket already exists error.
-			if e.Code != 409 {
-				return fmt.Errorf("failed to create bucket: %v", err)
-			} else {
-				fmt.Printf("Using the existing bucket: %v \n", bucketName)
-			}
-		} else {
-			return fmt.Errorf("failed to create bucket: %v", err)
-		}
-
-	} else {
-		fmt.Printf("Created new GCS bucket: %v\n", bucketName)
-	}
-	return nil
-}
-
-// GetProject returns the cloud project we should use for accessing Spanner.
+// GetProject returns the cloud project we should use by default to create resources.
 // Use environment variable GCLOUD_PROJECT if it is set.
 // Otherwise, use the default project returned from gcloud.
-func GetProject() (string, error) {
+func (gui *GetUtilInfoImpl) GetProject() (string, error) {
 	project := os.Getenv("GCLOUD_PROJECT")
 	if project != "" {
 		return project, nil
@@ -265,7 +208,7 @@ func GetProject() (string, error) {
 // GetInstance returns the Spanner instance we should use for creating DBs.
 // If the user specified instance (via flag 'instance') then use that.
 // Otherwise try to deduce the instance using gcloud.
-func GetInstance(ctx context.Context, project string, out *os.File) (string, error) {
+func (gui *GetUtilInfoImpl) GetInstance(ctx context.Context, project string, out *os.File) (string, error) {
 	l, err := getInstances(ctx, project)
 	if err != nil {
 		return "", err
@@ -286,15 +229,15 @@ func GetInstance(ctx context.Context, project string, out *os.File) (string, err
 	for i, x := range l {
 		fmt.Fprintf(out, " %d) %s\n", i+1, x)
 	}
-	fmt.Fprintf(out, "Please pick one of the available instances and set the flag '--instance'\n\n")
+	fmt.Fprintf(out, "Please pick one of the available instances and set the instance inside the '--target-profile' flag\n\n")
 	return "", fmt.Errorf("auto-selection of instance failed: project %s has more than one Spanner instance. "+
-		"Please use the flag '--instance' to select an instance", project)
+		"Please set the instance inside the '--target-profile' flag", project)
 }
 
 func getInstances(ctx context.Context, project string) ([]string, error) {
 	instanceClient, err := instance.NewInstanceAdminClient(ctx)
 	if err != nil {
-		return nil, AnalyzeError(err, fmt.Sprintf("projects/%s", project))
+		return nil, parse.AnalyzeError(err, fmt.Sprintf("projects/%s", project))
 	}
 	it := instanceClient.ListInstances(ctx, &instancepb.ListInstancesRequest{Parent: fmt.Sprintf("projects/%s", project)})
 	var l []string
@@ -304,18 +247,18 @@ func getInstances(ctx context.Context, project string) ([]string, error) {
 			break
 		}
 		if err != nil {
-			return nil, AnalyzeError(err, fmt.Sprintf("projects/%s", project))
+			return nil, parse.AnalyzeError(err, fmt.Sprintf("projects/%s", project))
 		}
 		l = append(l, strings.TrimPrefix(resp.Name, fmt.Sprintf("projects/%s/instances/", project)))
 	}
 	return l, nil
 }
 
-func GetPassword() string {
+func (gui *GetUtilInfoImpl) GetPassword() string {
 	calledFromGCloud := os.Getenv("GCLOUD_HB_PLUGIN")
 	if strings.EqualFold(calledFromGCloud, "true") {
 		fmt.Println("\n Please specify password in enviroment variables (recommended) or --source-profile " +
-			"(not recommended) while using HarbourBridge from gCloud CLI.")
+			"(not recommended) while using Spanner migration tool from gCloud CLI.")
 		return ""
 	}
 	fmt.Print("Enter Password: ")
@@ -329,7 +272,7 @@ func GetPassword() string {
 }
 
 // GetDatabaseName generates database name with driver_date prefix.
-func GetDatabaseName(driver string, now time.Time) (string, error) {
+func (gui *GetUtilInfoImpl) GetDatabaseName(driver string, now time.Time) (string, error) {
 	return GenerateName(fmt.Sprintf("%s_%s", driver, now.Format("2006-01-02")))
 }
 
@@ -343,60 +286,10 @@ func GenerateName(prefix string) (string, error) {
 	return fmt.Sprintf("%s_%x-%x", prefix, b[0:2], b[2:4]), nil
 }
 
-// parseURI parses an unknown URI string that could be a database, instance or project URI.
-func parseURI(URI string) (project, instance, dbName string) {
-	project, instance, dbName = "", "", ""
-	if strings.Contains(URI, "databases") {
-		project, instance, dbName = ParseDbURI(URI)
-	} else if strings.Contains(URI, "instances") {
-		project, instance = parseInstanceURI(URI)
-	} else if strings.Contains(URI, "projects") {
-		project = parseProjectURI(URI)
-	}
-	return
-}
-
-func ParseDbURI(dbURI string) (project, instance, dbName string) {
-	split := strings.Split(dbURI, "/databases/")
-	project, instance = parseInstanceURI(split[0])
-	dbName = split[1]
-	return
-}
-
-func parseInstanceURI(instanceURI string) (project, instance string) {
-	split := strings.Split(instanceURI, "/instances/")
-	project = parseProjectURI(split[0])
-	instance = split[1]
-	return
-}
-
-func parseProjectURI(projectURI string) (project string) {
-	split := strings.Split(projectURI, "/")
-	project = split[1]
-	return
-}
-
-// AnalyzeError inspects an error returned from Cloud Spanner and adds information
-// about potential root causes e.g. authentication issues.
-func AnalyzeError(err error, URI string) error {
-	project, instance, _ := parseURI(URI)
-	e := strings.ToLower(err.Error())
-	if ContainsAny(e, []string{"unauthenticated", "cannot fetch token", "default credentials"}) {
-		return fmt.Errorf("%w."+`
-Possible cause: credentials are mis-configured. Do you need to run
-
-  gcloud auth application-default login
-
-or configure environment variable GOOGLE_APPLICATION_CREDENTIALS.
-See https://cloud.google.com/docs/authentication/getting-started`, err)
-	}
-	if ContainsAny(e, []string{"instance not found"}) && instance != "" {
-		return fmt.Errorf("%w.\n"+`
-Possible cause: Spanner instance specified via instance option does not exist.
-Please check that '%s' is correct and that it is a valid Spanner
-instance for project %s`, err, instance, project)
-	}
-	return err
+func GenerateHashStr() string {
+	b := make([]byte, 4)
+	rand.Read(b)
+	return fmt.Sprintf("%x-%x", b[0:2], b[2:4])
 }
 
 // PrintPermissionsWarning prints permission warning.
@@ -405,21 +298,12 @@ func PrintPermissionsWarning(driver string, out *os.File) {
 		`
 WARNING: Please check that permissions for this Spanner instance are
 appropriate. Spanner manages access control at the database level, and the
-database created by HarbourBridge will inherit default permissions from this
+database created by Spanner migration tool will inherit default permissions from this
 instance. All data written to Spanner will be visible to anyone who can
 access the created database. Note that `+driver+` table-level and row-level
 ACLs are dropped during conversion since they are not supported by Spanner.
 
 `)
-}
-
-func ContainsAny(s string, l []string) bool {
-	for _, a := range l {
-		if strings.Contains(s, a) {
-			return true
-		}
-	}
-	return false
 }
 
 // CheckEqualSets checks if the set of values in a and b are equal.
@@ -472,7 +356,7 @@ func PrintSeekError(driver string, err error, out *os.File) {
 	fmt.Fprintf(out, "Likely cause: not enough space in %s.\n", os.TempDir())
 	fmt.Fprintf(out, "Try writing "+driver+" output to a file first i.e.\n")
 	fmt.Fprintf(out, " "+driver+" > tmpfile\n")
-	fmt.Fprintf(out, "  harbourbridge < tmpfile\n")
+	fmt.Fprintf(out, "  spanner-migration-tool < tmpfile\n")
 }
 
 // NewSpannerClient returns a new Spanner client.
@@ -560,12 +444,22 @@ func GetLegacyModeSupportedDrivers() []string {
 
 // ReadSpannerSchema fills conv by querying Spanner infoschema treating Spanner as both the source and dest.
 func ReadSpannerSchema(ctx context.Context, conv *internal.Conv, client *sp.Client) error {
-	infoSchema := spanner.InfoSchemaImpl{Client: client, Ctx: ctx, TargetDb: conv.TargetDb}
-	err := common.ProcessSchema(conv, infoSchema)
+	infoSchema := spanner.InfoSchemaImpl{Client: client, Ctx: ctx, SpDialect: conv.SpDialect}
+	processSchema := common.ProcessSchemaImpl{}
+	expressionVerificationAccessor, _ := expressions_api.NewExpressionVerificationAccessorImpl(ctx, conv.SpProjectId, conv.SpInstanceId)
+	ddlVerifier, err := expressions_api.NewDDLVerifierImpl(ctx, conv.SpProjectId, conv.SpInstanceId)
+	if err != nil {
+		return fmt.Errorf("error trying create ddl verifier: %v", err)
+	}
+	schemaToSpanner := common.SchemaToSpannerImpl{
+		DdlV:                           ddlVerifier,
+		ExpressionVerificationAccessor: expressionVerificationAccessor,
+	}
+	err = processSchema.ProcessSchema(conv, infoSchema, common.DefaultWorkers, internal.AdditionalSchemaAttributes{IsSharded: false}, &schemaToSpanner, &common.UtilsOrderImpl{}, &common.InfoSchemaImpl{})
 	if err != nil {
 		return fmt.Errorf("error trying to read and convert spanner schema: %v", err)
 	}
-	parentTables, err := infoSchema.GetInterleaveTables()
+	parentTables, err := infoSchema.GetInterleaveTables(conv.SpSchema)
 	if err != nil {
 		// We should ideally throw an error here as it could potentially cause a lot of failed writes.
 		// We raise an unexpected error for now to make it compatible with the integration tests.
@@ -573,69 +467,147 @@ func ReadSpannerSchema(ctx context.Context, conv *internal.Conv, client *sp.Clie
 		conv.Unexpected(fmt.Sprintf("error trying to fetch interleave table info from schema: %v", err))
 	}
 	// Assign parents if any.
-	for table, parent := range parentTables {
-		spTable := conv.SpSchema[table]
-		spTable.Parent = parent
-		conv.SpSchema[table] = spTable
+	for tableName, parentTable := range parentTables {
+		tableId, _ := internal.GetTableIdFromSpName(conv.SpSchema, tableName)
+		spTable := conv.SpSchema[tableId]
+		spTable.ParentTable.Id = parentTable.Id
+		spTable.ParentTable.OnDelete = parentTable.OnDelete
+		conv.SpSchema[tableId] = spTable
 	}
 	return nil
 }
 
 // CompareSchema compares the spanner schema of two conv objects and returns specific error if they don't match
-func CompareSchema(conv1, conv2 *internal.Conv) error {
-	if conv1.TargetDb != conv2.TargetDb {
-		return fmt.Errorf("target db don't match")
+func CompareSchema(sessionFileConv, actualSpannerConv *internal.Conv) error {
+	if sessionFileConv.SpDialect != actualSpannerConv.SpDialect {
+		return fmt.Errorf("spanner dialect don't match: session dialect %v, spanner dialect %v", sessionFileConv.SpDialect, actualSpannerConv.SpDialect)
 	}
-	for spannerTableInd := range conv1.SpSchema {
-		sessionTable := conv1.SpSchema[spannerTableInd]
-		spannerTable := conv2.SpSchema[spannerTableInd]
-		if sessionTable.Name != spannerTable.Name || sessionTable.Parent != spannerTable.Parent ||
-			len(sessionTable.Pks) != len(spannerTable.Pks) || len(sessionTable.ColDefs) != len(spannerTable.ColDefs) ||
-			len(sessionTable.Indexes) != len(spannerTable.Indexes) {
-			return fmt.Errorf("table detail for table %v don't match", sessionTable.Name)
+	for _, sessionTable := range sessionFileConv.SpSchema {
+		spannerTableId, err := internal.GetTableIdFromSpName(actualSpannerConv.SpSchema, sessionTable.Name)
+		if err != nil {
+			return fmt.Errorf("table %v not found in the spanner database schema but found in the session file. If this table does not need to be migrated, please exclude it during the schema conversion and migration process", sessionTable.Name)
 		}
-		for primaryKeyIndex := range sessionTable.Pks {
-			if sessionTable.Pks[primaryKeyIndex].Col != spannerTable.Pks[primaryKeyIndex].Col || sessionTable.Pks[primaryKeyIndex].Desc != spannerTable.Pks[primaryKeyIndex].Desc {
-				return fmt.Errorf("primary keys for table %v don't match", sessionTable.Name)
+		spannerTable := actualSpannerConv.SpSchema[spannerTableId]
+		sessionTableParentName := sessionFileConv.SpSchema[sessionTable.ParentTable.Id].Name
+		spannerTableParentName := actualSpannerConv.SpSchema[spannerTable.ParentTable.Id].Name
+
+		//table names should match
+		if sessionTable.Name != spannerTable.Name {
+			return fmt.Errorf("table name don't match: session table %v, spanner table %v", sessionTable.Name, spannerTable.Name)
+		}
+
+		//parent table names should match
+		if sessionTableParentName != spannerTableParentName {
+			return fmt.Errorf("parent table name don't match: session table %v, parent session table name: %v, spanner table %v, parent spanner table name: %v", sessionTable.Name, sessionTableParentName, spannerTable.Name, spannerTableParentName)
+		}
+
+		//parent table on delete actions should match
+		if sessionTable.ParentTable.OnDelete != spannerTable.ParentTable.OnDelete {
+			return fmt.Errorf("parent table on delete actions don't match: session table %v, parent session table name: %v, spanner table %v, parent spanner table name: %v", sessionTable.Name, sessionTable.ParentTable.OnDelete, spannerTable.Name, spannerTable.ParentTable.OnDelete)
+		}
+
+		//number of columns should match
+		if len(sessionTable.ColDefs) != len(spannerTable.ColDefs) {
+			return fmt.Errorf("number of columns don't match: session table %v, spanner table %v", sessionTable.Name, spannerTable.Name)
+		}
+
+		//primary keys should be of the same length
+		if len(sessionTable.PrimaryKeys) != len(spannerTable.PrimaryKeys) {
+			return fmt.Errorf("primary keys don't match: session table primary key length %v: %v, spanner table primary key length %v: %v", sessionTable.Name, len(sessionTable.PrimaryKeys), spannerTable.Name, len(spannerTable.PrimaryKeys))
+		}
+
+		// Sorts both primary key slices based on primary key order
+		sortKeysByOrder(sessionTable.PrimaryKeys)
+		sortKeysByOrder(spannerTable.PrimaryKeys)
+
+		//primary keys should be of the same order
+		for idx, sessionPk := range sessionTable.PrimaryKeys {
+			sessionTablePkCol := sessionTable.ColDefs[sessionPk.ColId]
+			correspondingSpColId, _ := internal.GetColIdFromSpName(spannerTable.ColDefs, sessionTablePkCol.Name)
+			spannerTablePkCol := spannerTable.ColDefs[correspondingSpColId]
+
+			if sessionTablePkCol.Name != spannerTablePkCol.Name || sessionTable.PrimaryKeys[idx].Desc != spannerTable.PrimaryKeys[idx].Desc {
+				return fmt.Errorf("primary keys for table %v are not identical: session table primary key %v, spanner table primary key %v", sessionTable.Name, sessionTable.PrimaryKeys, spannerTable.PrimaryKeys)
 			}
 		}
-		for col := range sessionTable.ColDefs {
-			colDef := sessionTable.ColDefs[col]
-			spannerCol := spannerTable.ColDefs[col]
-			if colDef.Name != spannerCol.Name || colDef.NotNull != spannerCol.NotNull ||
-				colDef.T.IsArray != spannerCol.T.IsArray || colDef.T.Len != spannerCol.T.Len || colDef.T.Name != spannerCol.T.Name {
-				return fmt.Errorf("column detail for table %v don't match", sessionTable.Name)
-			}
-		}
-		for _, sessionTableIndex := range sessionTable.Indexes {
-			found := 0
-			for _, spannerTableIndex := range spannerTable.Indexes {
-				if sessionTableIndex.Name == spannerTableIndex.Name {
-					found = 1
-					if sessionTableIndex.Table != spannerTableIndex.Table || sessionTableIndex.Unique != spannerTableIndex.Unique ||
-						len(sessionTableIndex.Keys) != len(spannerTableIndex.Keys) {
-						return fmt.Errorf("index %v - details don't match", sessionTableIndex.Name)
-					}
-					for keyIndex := range sessionTableIndex.Keys {
-						if sessionTableIndex.Keys[keyIndex].Col != spannerTableIndex.Keys[keyIndex].Col ||
-							sessionTableIndex.Keys[keyIndex].Desc != spannerTableIndex.Keys[keyIndex].Desc {
-							return fmt.Errorf("index %v - keys don't match", sessionTableIndex.Name)
-						}
-					}
-					break
+
+		//columns should be identical in terms of data type, name, length, nullability
+		for _, sessionColDef := range sessionTable.ColDefs {
+			correspondingSpColId, _ := internal.GetColIdFromSpName(spannerTable.ColDefs, sessionColDef.Name)
+			spannerColDef := spannerTable.ColDefs[correspondingSpColId]
+			// In case of PostgreSQL dialect, Spanner by default adds is_nullable = false to all the columns that are a part of primary key.
+			// Therefore, we cannot compare NotNull attributes for these columns.
+			if sessionFileConv.SpDialect == constants.DIALECT_POSTGRESQL && FindInPrimaryKey(sessionColDef.Id, sessionTable.PrimaryKeys) {
+				if sessionColDef.Name != spannerColDef.Name ||
+					sessionColDef.T.IsArray != spannerColDef.T.IsArray || sessionColDef.T.Len != spannerColDef.T.Len || sessionColDef.T.Name != spannerColDef.T.Name {
+					return fmt.Errorf("column detail for table %v don't match: session column name: %v, spanner column: %v", sessionTable.Name, sessionColDef, spannerColDef)
 				}
-			}
-			if found == 0 {
-				return fmt.Errorf("index %v not found in spanner schema", sessionTableIndex.Name)
+
+			} else {
+				if sessionColDef.Name != spannerColDef.Name ||
+					sessionColDef.T.IsArray != spannerColDef.T.IsArray || sessionColDef.T.Len != spannerColDef.T.Len || sessionColDef.T.Name != spannerColDef.T.Name || sessionColDef.NotNull != spannerColDef.NotNull {
+					return fmt.Errorf("column detail for table %v don't match: session column: %v, spanner column: %v", sessionTable.Name, sessionColDef, spannerColDef)
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func DialectToTarget(dialect string) string {
-	if strings.ToLower(dialect) == constants.DIALECT_POSTGRESQL {
-		return constants.TargetExperimentalPostgres
+func TargetDbToDialect(targetDb string) string {
+	if targetDb == constants.TargetExperimentalPostgres {
+		return constants.DIALECT_POSTGRESQL
 	}
-	return constants.TargetSpanner
+	return constants.DIALECT_GOOGLESQL
+}
+
+func sortKeysByOrder(pks []ddl.IndexKey) {
+	sort.Slice(pks, func(i int, j int) bool {
+		return pks[i].Order < pks[j].Order
+	})
+}
+
+func ConcatDirectoryPath(basePath, subPath string) string {
+	// ensure basePath doesn't start with '/' and ends with '/'
+	if basePath == "" || basePath == "/" {
+		basePath = ""
+	} else {
+		if basePath[0] == '/' {
+			basePath = basePath[1:]
+		}
+		if basePath[len(basePath)-1] != '/' {
+			basePath = basePath + "/"
+		}
+	}
+	// ensure subPath doesn't start with '/' ends with '/'
+	if subPath == "" || subPath == "/" {
+		subPath = ""
+	} else {
+		if subPath[0] == '/' {
+			subPath = subPath[1:]
+		}
+		if subPath[len(subPath)-1] != '/' {
+			subPath = subPath + "/"
+		}
+	}
+	path := fmt.Sprintf("%s%s", basePath, subPath)
+	return path
+}
+
+func FindInPrimaryKey(id string, primaryKeys []ddl.IndexKey) bool {
+
+	for _, pk := range primaryKeys {
+		if id == pk.ColId {
+			return true
+		}
+	}
+	return false
+}
+
+func SetDataflowTemplatePath(path string) {
+	dataflowTemplatePath = path
+}
+
+func GetDataflowTemplatePath() string {
+	return dataflowTemplatePath
 }

@@ -15,18 +15,24 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
+	"regexp"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/profiles"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/expressions_api"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/mocks"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/profiles"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 type mockSpec struct {
@@ -38,7 +44,6 @@ type mockSpec struct {
 
 func TestProcessSchemaMYSQL(t *testing.T) {
 	ms := []mockSpec{
-
 		{
 			query: "SELECT (.+) FROM information_schema.tables where table_type = 'BASE TABLE'  and (.+)",
 			args:  []driver.Value{"test"},
@@ -48,33 +53,56 @@ func TestProcessSchemaMYSQL(t *testing.T) {
 				{"cart"},
 				{"product"},
 				{"test"},
-				{"test_ref"}},
-		}, {
+				{"test_ref"},
+			},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
+			rows: [][]driver.Value{
+				{int64(0)},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "user"},
 			cols:  []string{"column_name", "constraint_type"},
 			rows: [][]driver.Value{
 				{"user_id", "PRIMARY KEY"},
-				{"ref", "FOREIGN KEY"}},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
-			args:  []driver.Value{"test", "user"},
-			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME"},
-			rows: [][]driver.Value{
-				{"test", "ref", "id", "fk_test"},
+				{"ref", "FOREIGN KEY"},
 			},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "user"},
-			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
-		}, {
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
+			rows: [][]driver.Value{
+				{"test", "ref", "id", "fk_test", constants.FK_SET_NULL, constants.FK_CASCADE},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
 			args:  []driver.Value{"test", "user"},
 			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
 			rows: [][]driver.Value{
-				{"user_id", "text", "text", "NO", nil, nil, nil, nil, nil},
-				{"name", "text", "text", "NO", nil, nil, nil, nil, nil},
+				{"user_id", "text", "text", "NO", "uuid()", nil, nil, nil, constants.DEFAULT_GENERATED},
+				{"name", "text", "text", "NO", "default_name", nil, nil, nil, nil},
 				{"ref", "bigint", "bigint", "NO", nil, nil, nil, nil, nil}},
+		},
+		// db call to fetch index happens after fetching of column
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+			args:  []driver.Value{"test", "user"},
+			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
+			rows: [][]driver.Value{
+				{int64(0)},
+			},
 		},
 		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
@@ -82,15 +110,30 @@ func TestProcessSchemaMYSQL(t *testing.T) {
 			cols:  []string{"column_name", "constraint_type"},
 			rows: [][]driver.Value{
 				{"productid", "PRIMARY KEY"},
-				{"userid", "PRIMARY KEY"}},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
+				{"userid", "PRIMARY KEY"},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "cart"},
-			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME"},
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
 			rows: [][]driver.Value{
-				{"product", "productid", "product_id", "fk_test2"},
-				{"user", "userid", "user_id", "fk_test3"}},
-		}, {
+				{"product", "productid", "product_id", "fk_test2", constants.FK_NO_ACTION, constants.FK_NO_ACTION},
+				{"user", "userid", "user_id", "fk_test3", constants.FK_RESTRICT, constants.FK_SET_NULL},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
+			args:  []driver.Value{"test", "cart"},
+			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
+			rows: [][]driver.Value{
+				{"productid", "text", "text", "NO", nil, nil, nil, nil, nil},
+				{"userid", "text", "text", "NO", nil, nil, nil, nil, nil},
+				{"quantity", "bigint", "bigint", "YES", nil, nil, 64, 0, nil},
+			},
+		},
+		// db call to fetch index happens after fetching of column
+		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
 			args:  []driver.Value{"test", "cart"},
 			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
@@ -99,52 +142,69 @@ func TestProcessSchemaMYSQL(t *testing.T) {
 				{"index2", "userid", 1, "A", "1"},
 				{"index2", "productid", 2, "D", "1"},
 				{"index3", "productid", 1, "A", "0"},
-				{"index3", "userid", 2, "D", "0"}},
-		}, {
-			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
-			args:  []driver.Value{"test", "cart"},
-			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
+				{"index3", "userid", 2, "D", "0"},
+			},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
 			rows: [][]driver.Value{
-				{"productid", "text", "text", "NO", nil, nil, nil, nil, nil},
-				{"userid", "text", "text", "NO", nil, nil, nil, nil, nil},
-				{"quantity", "bigint", "bigint", "YES", nil, nil, 64, 0, nil}},
-		}, {
+				{int64(0)},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "product"},
 			cols:  []string{"column_name", "constraint_type"},
 			rows: [][]driver.Value{
-				{"product_id", "PRIMARY KEY"}},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
+				{"product_id", "PRIMARY KEY"},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "product"},
-			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME"},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
-			args:  []driver.Value{"test", "product"},
-			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
-		}, {
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
+		},
+		{
 			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
 			args:  []driver.Value{"test", "product"},
 			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
 			rows: [][]driver.Value{
 				{"product_id", "text", "text", "NO", nil, nil, nil, nil, nil},
-				{"product_name", "text", "text", "NO", nil, nil, nil, nil, nil}},
-		}, {
+				{"product_name", "text", "text", "NO", nil, nil, nil, nil, nil},
+			},
+		},
+		// db call to fetch index happens after fetching of column
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+			args:  []driver.Value{"test", "product"},
+			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
+			rows: [][]driver.Value{
+				{int64(0)},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "test"},
 			cols:  []string{"column_name", "constraint_type"},
 			rows:  [][]driver.Value{{"id", "PRIMARY KEY"}, {"id", "FOREIGN KEY"}},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "test"},
-			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME"},
-			rows: [][]driver.Value{{"test_ref", "id", "ref_id", "fk_test4"},
-				{"test_ref", "txt", "ref_txt", "fk_test4"}},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
-			args:  []driver.Value{"test", "test"},
-			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
-		}, {
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
+			rows: [][]driver.Value{
+				{"test_ref", "id", "ref_id", "fk_test4", constants.FK_CASCADE, constants.FK_RESTRICT},
+				{"test_ref", "txt", "ref_txt", "fk_test4", constants.FK_CASCADE, constants.FK_RESTRICT},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
 			args:  []driver.Value{"test", "test"},
 			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
@@ -168,118 +228,119 @@ func TestProcessSchemaMYSQL(t *testing.T) {
 				{"ts", "datetime", "datetime", "YES", nil, nil, nil, nil, nil},
 				{"tz", "timestamp", "timestamp", "YES", nil, nil, nil, nil, nil},
 				{"vc", "varchar", "varchar", "YES", nil, nil, nil, nil, nil},
-				{"vc6", "varchar", "varchar(6)", "YES", nil, 6, nil, nil, nil}},
-		}, {
+				{"vc6", "varchar", "varchar(6)", "YES", nil, 6, nil, nil, nil},
+			},
+		},
+		// db call to fetch index happens after fetching of column
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+			args:  []driver.Value{"test", "test"},
+			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
+			rows: [][]driver.Value{
+				{int64(0)},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "test_ref"},
 			cols:  []string{"column_name", "constraint_type"},
 			rows: [][]driver.Value{
 				{"ref_id", "PRIMARY KEY"},
-				{"ref_txt", "PRIMARY KEY"}},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
+				{"ref_txt", "PRIMARY KEY"},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "test_ref"},
-			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME"},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
-			args:  []driver.Value{"test", "test_ref"},
-			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
-		}, {
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
+		},
+		{
 			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
 			args:  []driver.Value{"test", "test_ref"},
 			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
 			rows: [][]driver.Value{
 				{"ref_id", "bigint", "bigint", "NO", nil, nil, 64, 0, nil},
 				{"ref_txt", "text", "text", "NO", nil, nil, nil, nil, nil},
-				{"abc", "text", "text", "NO", nil, nil, nil, nil, nil}},
+				{"abc", "text", "text", "NO", nil, nil, nil, nil, nil},
+			},
+		},
+		// db call to fetch index happens after fetching of column
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+			args:  []driver.Value{"test", "test_ref"},
+			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
 		},
 	}
 	db := mkMockDB(t, ms)
 	conv := internal.MakeConv()
-	isi := InfoSchemaImpl{"test", db, profiles.SourceProfile{}, profiles.TargetProfile{}}
-	err := common.ProcessSchema(conv, isi)
+	isi := InfoSchemaImpl{"test", db, "migration-project-id", profiles.SourceProfile{}, profiles.TargetProfile{}}
+	commonInfoSchema := common.InfoSchemaImpl{}
+	_, err := commonInfoSchema.GenerateSrcSchema(conv, isi, 1)
 	assert.Nil(t, err)
-	expectedSchema := map[string]ddl.CreateTable{
-		"user": ddl.CreateTable{
-			Name:     "user",
-			ColNames: []string{"user_id", "name", "ref"},
-			ColDefs: map[string]ddl.ColumnDef{
-				"user_id": ddl.ColumnDef{Name: "user_id", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"name":    ddl.ColumnDef{Name: "name", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"ref":     ddl.ColumnDef{Name: "ref", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
+	expectedSchema := map[string]schema.Table{
+		"cart": {
+			Name: "cart", Schema: "test", ColIds: []string{"productid", "userid", "quantity"}, ColDefs: map[string]schema.Column{
+				"productid": {Name: "productid", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+				"quantity":  {Name: "quantity", Type: schema.Type{Name: "bigint", Mods: []int64{64}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+				"userid":    {Name: "userid", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
 			},
-			Pks: []ddl.IndexKey{ddl.IndexKey{Col: "user_id"}},
-			Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test", Columns: []string{"ref"}, ReferTable: "test", ReferColumns: []string{"id"}}}},
-		"cart": ddl.CreateTable{
-			Name:     "cart",
-			ColNames: []string{"productid", "userid", "quantity"},
-			ColDefs: map[string]ddl.ColumnDef{
-				"productid": ddl.ColumnDef{Name: "productid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"userid":    ddl.ColumnDef{Name: "userid", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"quantity":  ddl.ColumnDef{Name: "quantity", T: ddl.Type{Name: ddl.Int64}},
+			PrimaryKeys: []schema.Key{{ColId: "productid", Desc: false, Order: 0}, {ColId: "userid", Desc: false, Order: 0}},
+			ForeignKeys: []schema.ForeignKey{{Name: "fk_test2", ColIds: []string{"productid"}, ReferTableId: "product", ReferColumnIds: []string{"product_id"}, OnDelete: constants.FK_NO_ACTION, OnUpdate: constants.FK_NO_ACTION, Id: ""}, {Name: "fk_test3", ColIds: []string{"userid"}, ReferTableId: "user", ReferColumnIds: []string{"user_id"}, OnUpdate: constants.FK_SET_NULL, OnDelete: constants.FK_RESTRICT, Id: ""}},
+			Indexes:     []schema.Index{{Name: "index1", Unique: true, Keys: []schema.Key{{ColId: "userid", Desc: false, Order: 0}}, Id: "", StoredColumnIds: []string(nil)}, {Name: "index2", Unique: false, Keys: []schema.Key{{ColId: "userid", Desc: false, Order: 0}, {ColId: "productid", Desc: true, Order: 0}}, Id: "", StoredColumnIds: []string(nil)}, {Name: "index3", Unique: true, Keys: []schema.Key{{ColId: "productid", Desc: false, Order: 0}, {ColId: "userid", Desc: true, Order: 0}}, Id: "", StoredColumnIds: []string(nil)}}, Id: "",
+		},
+
+		"product": {
+			Name: "product", Schema: "test", ColIds: []string{"product_id", "product_name"}, ColDefs: map[string]schema.Column{
+				"product_id":   {Name: "product_id", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+				"product_name": {Name: "product_name", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
 			},
-			Pks: []ddl.IndexKey{ddl.IndexKey{Col: "productid"}, ddl.IndexKey{Col: "userid"}},
-			Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test2", Columns: []string{"productid"}, ReferTable: "product", ReferColumns: []string{"product_id"}},
-				ddl.Foreignkey{Name: "fk_test3", Columns: []string{"userid"}, ReferTable: "user", ReferColumns: []string{"user_id"}}},
-			Indexes: []ddl.CreateIndex{ddl.CreateIndex{Name: "index1", Table: "cart", Unique: true, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "userid", Desc: false}}},
-				ddl.CreateIndex{Name: "index2", Table: "cart", Unique: false, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "userid", Desc: false}, ddl.IndexKey{Col: "productid", Desc: true}}},
-				ddl.CreateIndex{Name: "index3", Table: "cart", Unique: true, Keys: []ddl.IndexKey{ddl.IndexKey{Col: "productid", Desc: false}, ddl.IndexKey{Col: "userid", Desc: true}}}}},
-		"product": ddl.CreateTable{
-			Name:     "product",
-			ColNames: []string{"product_id", "product_name"},
-			ColDefs: map[string]ddl.ColumnDef{
-				"product_id":   ddl.ColumnDef{Name: "product_id", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"product_name": ddl.ColumnDef{Name: "product_name", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-			},
-			Pks: []ddl.IndexKey{ddl.IndexKey{Col: "product_id"}}},
-		"test": ddl.CreateTable{
-			Name:     "test",
-			ColNames: []string{"id", "s", "txt", "b", "bs", "bl", "c", "c8", "d", "dec", "f8", "f4", "i8", "i4", "i2", "si", "ts", "tz", "vc", "vc6"},
-			ColDefs: map[string]ddl.ColumnDef{
-				"id":  ddl.ColumnDef{Name: "id", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
-				"s":   ddl.ColumnDef{Name: "s", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength, IsArray: true}},
-				"txt": ddl.ColumnDef{Name: "txt", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"b":   ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.Bool}},
-				"bs":  ddl.ColumnDef{Name: "bs", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
-				"bl":  ddl.ColumnDef{Name: "bl", T: ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}},
-				"c":   ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
-				"c8":  ddl.ColumnDef{Name: "c8", T: ddl.Type{Name: ddl.String, Len: int64(8)}},
-				"d":   ddl.ColumnDef{Name: "d", T: ddl.Type{Name: ddl.Date}},
-				"dec": ddl.ColumnDef{Name: "dec", T: ddl.Type{Name: ddl.Numeric}},
-				"f8":  ddl.ColumnDef{Name: "f8", T: ddl.Type{Name: ddl.Float64}},
-				"f4":  ddl.ColumnDef{Name: "f4", T: ddl.Type{Name: ddl.Float64}},
-				"i8":  ddl.ColumnDef{Name: "i8", T: ddl.Type{Name: ddl.Int64}},
-				"i4":  ddl.ColumnDef{Name: "i4", T: ddl.Type{Name: ddl.Int64}},
-				"i2":  ddl.ColumnDef{Name: "i2", T: ddl.Type{Name: ddl.Int64}},
-				"si":  ddl.ColumnDef{Name: "si", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
-				"ts":  ddl.ColumnDef{Name: "ts", T: ddl.Type{Name: ddl.Timestamp}},
-				"tz":  ddl.ColumnDef{Name: "tz", T: ddl.Type{Name: ddl.Timestamp}},
-				"vc":  ddl.ColumnDef{Name: "vc", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
-				"vc6": ddl.ColumnDef{Name: "vc6", T: ddl.Type{Name: ddl.String, Len: int64(6)}},
-			},
-			Pks: []ddl.IndexKey{ddl.IndexKey{Col: "id"}},
-			Fks: []ddl.Foreignkey{ddl.Foreignkey{Name: "fk_test4", Columns: []string{"id", "txt"}, ReferTable: "test_ref", ReferColumns: []string{"ref_id", "ref_txt"}}}},
-		"test_ref": ddl.CreateTable{
-			Name:     "test_ref",
-			ColNames: []string{"ref_id", "ref_txt", "abc"},
-			ColDefs: map[string]ddl.ColumnDef{
-				"ref_id":  ddl.ColumnDef{Name: "ref_id", T: ddl.Type{Name: ddl.Int64}, NotNull: true},
-				"ref_txt": ddl.ColumnDef{Name: "ref_txt", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"abc":     ddl.ColumnDef{Name: "abc", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-			},
-			Pks: []ddl.IndexKey{ddl.IndexKey{Col: "ref_id"}, ddl.IndexKey{Col: "ref_txt"}}},
-	}
-	assert.Equal(t, expectedSchema, stripSchemaComments(conv.SpSchema))
-	assert.Equal(t, len(conv.Issues["cart"]), 0)
-	expectedIssues := map[string][]internal.SchemaIssue{
-		"bs": []internal.SchemaIssue{internal.DefaultValue},
-		"f4": []internal.SchemaIssue{internal.Widened},
-		"i4": []internal.SchemaIssue{internal.Widened, internal.AutoIncrement},
-		"i2": []internal.SchemaIssue{internal.Widened},
-		"si": []internal.SchemaIssue{internal.Widened, internal.DefaultValue},
-		"ts": []internal.SchemaIssue{internal.Datetime},
-	}
-	assert.Equal(t, expectedIssues, conv.Issues["test"])
+			PrimaryKeys: []schema.Key{{ColId: "product_id", Desc: false, Order: 0}},
+			ForeignKeys: []schema.ForeignKey(nil),
+			Indexes:     []schema.Index(nil), Id: ""},
+		"test": schema.Table{Name: "test", Schema: "test", ColIds: []string{"id", "s", "txt", "b", "bs", "bl", "c", "c8", "d", "dec", "f8", "f4", "i8", "i4", "i2", "si", "ts", "tz", "vc", "vc6"}, ColDefs: map[string]schema.Column{
+			"b":   schema.Column{Name: "b", Type: schema.Type{Name: "boolean", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"bl":  schema.Column{Name: "bl", Type: schema.Type{Name: "blob", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"bs":  schema.Column{Name: "bs", Type: schema.Type{Name: "bigint", Mods: []int64{64}, ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: true, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: "", DefaultValue: ddl.DefaultValue{IsPresent: true, Value: ddl.Expression{ExpressionId: "e27", Statement: "nextval('test11_bs_seq'::regclass)"}}},
+			"c":   schema.Column{Name: "c", Type: schema.Type{Name: "char", Mods: []int64{1}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"c8":  schema.Column{Name: "c8", Type: schema.Type{Name: "char", Mods: []int64{8}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"d":   schema.Column{Name: "d", Type: schema.Type{Name: "date", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"dec": schema.Column{Name: "dec", Type: schema.Type{Name: "decimal", Mods: []int64{20, 5}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"f4":  schema.Column{Name: "f4", Type: schema.Type{Name: "float", Mods: []int64{24}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"f8":  schema.Column{Name: "f8", Type: schema.Type{Name: "double", Mods: []int64{53}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"i2":  schema.Column{Name: "i2", Type: schema.Type{Name: "smallint", Mods: []int64{16}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"i4":  schema.Column{Name: "i4", Type: schema.Type{Name: "integer", Mods: []int64{32}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: "", AutoGen: ddl.AutoGenCol{Name: "Sequence37", GenerationType: constants.AUTO_INCREMENT}},
+			"i8":  schema.Column{Name: "i8", Type: schema.Type{Name: "bigint", Mods: []int64{64}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"id":  schema.Column{Name: "id", Type: schema.Type{Name: "bigint", Mods: []int64{64}, ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"s":   schema.Column{Name: "s", Type: schema.Type{Name: "set", Mods: []int64(nil), ArrayBounds: []int64{-1}}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"si":  schema.Column{Name: "si", Type: schema.Type{Name: "integer", Mods: []int64{32}, ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: true, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: "", DefaultValue: ddl.DefaultValue{IsPresent: true, Value: ddl.Expression{ExpressionId: "e40", Statement: "nextval('test11_s_seq'::regclass)"}}},
+			"ts":  schema.Column{Name: "ts", Type: schema.Type{Name: "datetime", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"txt": schema.Column{Name: "txt", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"tz":  schema.Column{Name: "tz", Type: schema.Type{Name: "timestamp", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"vc":  schema.Column{Name: "vc", Type: schema.Type{Name: "varchar", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"vc6": schema.Column{Name: "vc6", Type: schema.Type{Name: "varchar", Mods: []int64{6}, ArrayBounds: []int64(nil)}, NotNull: false, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""}},
+			PrimaryKeys: []schema.Key{schema.Key{ColId: "id", Desc: false, Order: 0}},
+			ForeignKeys: []schema.ForeignKey{schema.ForeignKey{Name: "fk_test4", ColIds: []string{"id", "txt"}, ReferTableId: "test_ref", ReferColumnIds: []string{"ref_id", "ref_txt"}, OnUpdate: constants.FK_RESTRICT, OnDelete: constants.FK_CASCADE, Id: ""}},
+			Indexes:     []schema.Index(nil), Id: ""},
+		"test_ref": schema.Table{Name: "test_ref", Schema: "test", ColIds: []string{"ref_id", "ref_txt", "abc"}, ColDefs: map[string]schema.Column{
+			"abc":     schema.Column{Name: "abc", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"ref_id":  schema.Column{Name: "ref_id", Type: schema.Type{Name: "bigint", Mods: []int64{64}, ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"ref_txt": schema.Column{Name: "ref_txt", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""}},
+			PrimaryKeys: []schema.Key{schema.Key{ColId: "ref_id", Desc: false, Order: 0}, schema.Key{ColId: "ref_txt", Desc: false, Order: 0}},
+			ForeignKeys: []schema.ForeignKey(nil),
+			Indexes:     []schema.Index(nil), Id: ""},
+		"user": schema.Table{Name: "user", Schema: "test", ColIds: []string{"user_id", "name", "ref"}, ColDefs: map[string]schema.Column{
+			"name":    schema.Column{Name: "name", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: true, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: "", DefaultValue: ddl.DefaultValue{Value: ddl.Expression{ExpressionId: "e6", Statement: "'default_name'"}, IsPresent: true}},
+			"ref":     schema.Column{Name: "ref", Type: schema.Type{Name: "bigint", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: false, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: ""},
+			"user_id": schema.Column{Name: "user_id", Type: schema.Type{Name: "text", Mods: []int64(nil), ArrayBounds: []int64(nil)}, NotNull: true, Ignored: schema.Ignored{Check: false, Identity: false, Default: true, Exclusion: false, ForeignKey: false, AutoIncrement: false}, Id: "", DefaultValue: ddl.DefaultValue{Value: ddl.Expression{ExpressionId: "e4", Statement: "uuid()"}, IsPresent: true}}},
+			PrimaryKeys: []schema.Key{schema.Key{ColId: "user_id", Desc: false, Order: 0}},
+			ForeignKeys: []schema.ForeignKey{schema.ForeignKey{Name: "fk_test", ColIds: []string{"ref"}, ReferTableId: "test", ReferColumnIds: []string{"id"}, OnUpdate: constants.FK_CASCADE, OnDelete: constants.FK_SET_NULL, Id: ""}},
+			Indexes:     []schema.Index(nil), Id: ""}}
+	internal.AssertSrcSchema(t, conv, expectedSchema, conv.SrcSchema)
 	assert.Equal(t, int64(0), conv.Unexpecteds())
 }
 
@@ -291,28 +352,38 @@ func TestProcessData(t *testing.T) {
 			rows: [][]driver.Value{
 				{42.3, 3, "cat"},
 				{6.6, 22, "dog"},
-				{6.6, "2006-01-02", "dog"}}, // Test bad row logic.
+				{6.6, "2006-01-02", "dog"},
+			}, // Test bad row logic.
 		},
 	}
 	db := mkMockDB(t, ms)
 	conv := buildConv(
 		ddl.CreateTable{
-			Name:     "te_st",
-			ColNames: []string{"a a", " b", " c "},
+			Name:   "te_st",
+			Id:     "t1",
+			ColIds: []string{"c1", "c2", "c3"},
 			ColDefs: map[string]ddl.ColumnDef{
-				"a_a": ddl.ColumnDef{Name: "a_a", T: ddl.Type{Name: ddl.Float64}},
-				"Ab":  ddl.ColumnDef{Name: "Ab", T: ddl.Type{Name: ddl.Int64}},
-				"Ac_": ddl.ColumnDef{Name: "Ac_", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
-			}},
+				"c1": {Name: "a_a", Id: "c1", T: ddl.Type{Name: ddl.Float64}},
+				"c2": {Name: "Ab", Id: "c2", T: ddl.Type{Name: ddl.Int64}},
+				"c3": {Name: "Ac_", Id: "c3", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}},
+			},
+		},
 		schema.Table{
-			Name:     "te st",
-			Schema:   "test",
-			ColNames: []string{"a_a", "_b", "_c_"},
+			Name:   "te st",
+			Id:     "t1",
+			Schema: "test",
+			ColIds: []string{"c1", "c2", "c3"},
 			ColDefs: map[string]schema.Column{
-				"a a": schema.Column{Name: "a a", Type: schema.Type{Name: "float"}},
-				" b":  schema.Column{Name: " b", Type: schema.Type{Name: "int"}},
-				" c ": schema.Column{Name: " c ", Type: schema.Type{Name: "text"}},
-			}})
+				"c1": {Name: "a a", Id: "c1", Type: schema.Type{Name: "float"}},
+				"c2": {Name: " b", Id: "c2", Type: schema.Type{Name: "int"}},
+				"c3": {Name: " c ", Id: "c3", Type: schema.Type{Name: "text"}},
+			},
+			ColNameIdMap: map[string]string{
+				"a a": "c1",
+				" b":  "c2",
+				" c ": "c3",
+			},
+		})
 
 	conv.SetDataMode()
 	var rows []spannerData
@@ -320,12 +391,13 @@ func TestProcessData(t *testing.T) {
 		func(table string, cols []string, vals []interface{}) {
 			rows = append(rows, spannerData{table: table, cols: cols, vals: vals})
 		})
-	isi := InfoSchemaImpl{"test", db, profiles.SourceProfile{}, profiles.TargetProfile{}}
-	common.ProcessData(conv, isi)
+	isi := InfoSchemaImpl{"test", db, "migration-project-id", profiles.SourceProfile{}, profiles.TargetProfile{}}
+	commonInfoSchema := common.InfoSchemaImpl{}
+	commonInfoSchema.ProcessData(conv, isi, internal.AdditionalDataAttributes{})
 	assert.Equal(t,
 		[]spannerData{
-			spannerData{table: "te_st", cols: []string{"a_a", "Ab", "Ac_"}, vals: []interface{}{float64(42.3), int64(3), "cat"}},
-			spannerData{table: "te_st", cols: []string{"a_a", "Ab", "Ac_"}, vals: []interface{}{float64(6.6), int64(22), "dog"}},
+			{table: "te_st", cols: []string{"a_a", "Ab", "Ac_"}, vals: []interface{}{float64(42.3), int64(3), "cat"}},
+			{table: "te_st", cols: []string{"a_a", "Ab", "Ac_"}, vals: []interface{}{float64(6.6), int64(22), "dog"}},
 		},
 		rows)
 	assert.Equal(t, conv.BadRows(), int64(1))
@@ -345,56 +417,93 @@ func TestProcessData_MultiCol(t *testing.T) {
 			args:  []driver.Value{"test"},
 			cols:  []string{"table_name"},
 			rows:  [][]driver.Value{{"test"}},
-		}, {
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
+			rows: [][]driver.Value{
+				{int64(0)},
+			},
+		},
+		{
 			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "test"},
 			cols:  []string{"column_name", "constraint_type"},
 			rows:  [][]driver.Value{}, // No primary key --> force generation of synthetic key.
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
 			args:  []driver.Value{"test", "test"},
-			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME"},
-		}, {
-			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
-			args:  []driver.Value{"test", "test"},
-			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
-		}, {
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
+		},
+		{
 			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
 			args:  []driver.Value{"test", "test"},
 			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
 			rows: [][]driver.Value{
 				{"a", "text", "text", "NO", nil, nil, nil, nil, nil},
 				{"b", "double", "double", "YES", nil, nil, 53, nil, nil},
-				{"c", "bigint", "bigint", "YES", nil, nil, 64, 0, nil}},
+				{"c", "bigint", "bigint", "YES", nil, nil, 64, 0, nil},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+			args:  []driver.Value{"test", "test"},
+			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
 		},
 		{
 			query: "SELECT (.+) FROM `test`.`test`",
 			cols:  []string{"a", "b", "c"},
 			rows: [][]driver.Value{
 				{"cat", 42.3, nil},
-				{"dog", nil, 22}},
+				{"dog", nil, 22},
+			},
 		},
 	}
 	db := mkMockDB(t, ms)
 	conv := internal.MakeConv()
-	isi := InfoSchemaImpl{"test", db, profiles.SourceProfile{}, profiles.TargetProfile{}}
-	err := common.ProcessSchema(conv, isi)
+	isi := InfoSchemaImpl{"test", db, "migration-project-id", profiles.SourceProfile{}, profiles.TargetProfile{}}
+	processSchema := common.ProcessSchemaImpl{}
+	mockAccessor := new(mocks.MockExpressionVerificationAccessor)
+	ctx := context.Background()
+	mockAccessor.On("VerifyExpressions", ctx, mock.Anything).Return(internal.VerifyExpressionsOutput{
+		ExpressionVerificationOutputList: []internal.ExpressionVerificationOutput{
+			{Result: true, Err: nil, ExpressionDetail: internal.ExpressionDetail{Expression: "(col1 > 0)", Type: "CHECK", Metadata: map[string]string{"tableId": "t1", "colId": "c1", "checkConstraintName": "check1"}, ExpressionId: "expr1"}},
+		},
+	})
+
+	schemaToSpanner := common.SchemaToSpannerImpl{
+		ExpressionVerificationAccessor: mockAccessor,
+		DdlV:                           &expressions_api.MockDDLVerifier{},
+	}
+	err := processSchema.ProcessSchema(conv, isi, 1, internal.AdditionalSchemaAttributes{}, &schemaToSpanner, &common.UtilsOrderImpl{}, &common.InfoSchemaImpl{})
 	assert.Nil(t, err)
 	expectedSchema := map[string]ddl.CreateTable{
-		"test": ddl.CreateTable{
-			Name:     "test",
-			ColNames: []string{"a", "b", "c", "synth_id"},
+		"test": {
+			Name:   "test",
+			ColIds: []string{"a", "b", "c", "synth_id"},
 			ColDefs: map[string]ddl.ColumnDef{
-				"a":        ddl.ColumnDef{Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
-				"b":        ddl.ColumnDef{Name: "b", T: ddl.Type{Name: ddl.Float64}},
-				"c":        ddl.ColumnDef{Name: "c", T: ddl.Type{Name: ddl.Int64}},
-				"synth_id": ddl.ColumnDef{Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
+				"a":        {Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
+				"b":        {Name: "b", T: ddl.Type{Name: ddl.Float64}},
+				"c":        {Name: "c", T: ddl.Type{Name: ddl.Int64}},
+				"synth_id": {Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
 			},
-			Pks: []ddl.IndexKey{ddl.IndexKey{Col: "synth_id"}}},
+			PrimaryKeys: []ddl.IndexKey{{ColId: "synth_id", Order: 1}},
+		},
 	}
-	assert.Equal(t, expectedSchema, stripSchemaComments(conv.SpSchema))
-	expectedIssues := map[string][]internal.SchemaIssue{}
-	assert.Equal(t, expectedIssues, conv.Issues["test"])
+	internal.AssertSpSchema(conv, t, expectedSchema, stripSchemaComments(conv.SpSchema))
+	columnLevelIssues := map[string][]internal.SchemaIssue{
+		"c53": []internal.SchemaIssue{
+			2,
+		},
+	}
+	expectedIssues := internal.TableIssues{
+		ColumnLevelIssues: columnLevelIssues,
+	}
+	tableId, err := internal.GetTableIdFromSpName(conv.SpSchema, "test")
+	assert.Equal(t, nil, err)
+	assert.Equal(t, expectedIssues, conv.SchemaIssues[tableId])
 	assert.Equal(t, int64(0), conv.Unexpecteds())
 	conv.SetDataMode()
 	var rows []spannerData
@@ -402,12 +511,104 @@ func TestProcessData_MultiCol(t *testing.T) {
 		func(table string, cols []string, vals []interface{}) {
 			rows = append(rows, spannerData{table: table, cols: cols, vals: vals})
 		})
-	common.ProcessData(conv, isi)
+	commonInfoSchema := common.InfoSchemaImpl{}
+	commonInfoSchema.ProcessData(conv, isi, internal.AdditionalDataAttributes{})
 	assert.Equal(t, []spannerData{
 		{table: "test", cols: []string{"a", "b", "synth_id"}, vals: []interface{}{"cat", float64(42.3), "0"}},
-		{table: "test", cols: []string{"a", "c", "synth_id"}, vals: []interface{}{"dog", int64(22), "-9223372036854775808"}}},
+		{table: "test", cols: []string{"a", "c", "synth_id"}, vals: []interface{}{"dog", int64(22), "-9223372036854775808"}},
+	},
 		rows)
 	assert.Equal(t, int64(0), conv.Unexpecteds())
+}
+
+func TestProcessSchema_Sharded(t *testing.T) {
+	// Tests multi-column behavior of ProcessSQLData (including
+	// handling of null columns and synthetic keys). Also tests
+	// the combination of ProcessInfoSchema and ProcessSQLData
+	// i.e. ProcessSQLData uses the schemas built by
+	// ProcessInfoSchema.
+	ms := []mockSpec{
+		{
+			query: "SELECT table_name FROM information_schema.tables where table_type = 'BASE TABLE' and (.+)",
+			args:  []driver.Value{"test"},
+			cols:  []string{"table_name"},
+			rows:  [][]driver.Value{{"test"}},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			args:  nil,
+			cols:  []string{"count"},
+			rows: [][]driver.Value{
+				{int64(0)},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS (.+)",
+			args:  []driver.Value{"test", "test"},
+			cols:  []string{"column_name", "constraint_type"},
+			rows:  [][]driver.Value{}, // No primary key --> force generation of synthetic key.
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS (.+)",
+			args:  []driver.Value{"test", "test"},
+			cols:  []string{"REFERENCED_TABLE_NAME", "COLUMN_NAME", "REFERENCED_COLUMN_NAME", "CONSTRAINT_NAME", "DELETE_RULE", "UPDATE_RULE"},
+		},
+		{
+			query: "SELECT (.+) FROM information_schema.COLUMNS (.+)",
+			args:  []driver.Value{"test", "test"},
+			cols:  []string{"column_name", "data_type", "column_type", "is_nullable", "column_default", "character_maximum_length", "numeric_precision", "numeric_scale", "extra"},
+			rows: [][]driver.Value{
+				{"a", "text", "text", "NO", nil, nil, nil, nil, nil},
+				{"b", "double", "double", "YES", nil, nil, 53, nil, nil},
+				{"c", "bigint", "bigint", "YES", nil, nil, 64, 0, nil},
+			},
+		},
+		{
+			query: "SELECT (.+) FROM INFORMATION_SCHEMA.STATISTICS (.+)",
+			args:  []driver.Value{"test", "test"},
+			cols:  []string{"INDEX_NAME", "COLUMN_NAME", "SEQ_IN_INDEX", "COLLATION", "NON_UNIQUE"},
+		},
+		{
+			query: "SELECT (.+) FROM `test`.`test`",
+			cols:  []string{"a", "b", "c"},
+			rows: [][]driver.Value{
+				{"cat", 42.3, nil},
+				{"dog", nil, 22},
+			},
+		},
+	}
+	db := mkMockDB(t, ms)
+	conv := internal.MakeConv()
+	isi := InfoSchemaImpl{"test", db, "migration-project-id", profiles.SourceProfile{}, profiles.TargetProfile{}}
+	mockAccessor := new(mocks.MockExpressionVerificationAccessor)
+	ctx := context.Background()
+	mockAccessor.On("VerifyExpressions", ctx, mock.Anything).Return(internal.VerifyExpressionsOutput{
+		ExpressionVerificationOutputList: []internal.ExpressionVerificationOutput{
+			{Result: true, Err: nil, ExpressionDetail: internal.ExpressionDetail{Expression: "(col1 > 0)", Type: "CHECK", Metadata: map[string]string{"tableId": "t1", "colId": "c1", "checkConstraintName": "check1"}, ExpressionId: "expr1"}},
+		},
+	})
+	processSchema := common.ProcessSchemaImpl{}
+	schemaToSpanner := common.SchemaToSpannerImpl{
+		ExpressionVerificationAccessor: mockAccessor,
+		DdlV:                           &expressions_api.MockDDLVerifier{},
+	}
+	err := processSchema.ProcessSchema(conv, isi, 1, internal.AdditionalSchemaAttributes{IsSharded: true}, &schemaToSpanner, &common.UtilsOrderImpl{}, &common.InfoSchemaImpl{})
+	assert.Nil(t, err)
+	expectedSchema := map[string]ddl.CreateTable{
+		"test": {
+			Name:   "test",
+			ColIds: []string{"a", "b", "c", "synth_id"},
+			ColDefs: map[string]ddl.ColumnDef{
+				"a":                  {Name: "a", T: ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, NotNull: true},
+				"b":                  {Name: "b", T: ddl.Type{Name: ddl.Float64}},
+				"c":                  {Name: "c", T: ddl.Type{Name: ddl.Int64}},
+				"synth_id":           {Name: "synth_id", T: ddl.Type{Name: ddl.String, Len: 50}},
+				"migration_shard_id": {Name: "migration_shard_id", T: ddl.Type{Name: ddl.String, Len: 50}},
+			},
+			PrimaryKeys: []ddl.IndexKey{{ColId: "synth_id", Order: 1}},
+		},
+	}
+	internal.AssertSpSchema(conv, t, expectedSchema, stripSchemaComments(conv.SpSchema))
 }
 
 func TestSetRowStats(t *testing.T) {
@@ -430,8 +631,9 @@ func TestSetRowStats(t *testing.T) {
 	db := mkMockDB(t, ms)
 	conv := internal.MakeConv()
 	conv.SetDataMode()
-	isi := InfoSchemaImpl{"test", db, profiles.SourceProfile{}, profiles.TargetProfile{}}
-	common.SetRowStats(conv, isi)
+	isi := InfoSchemaImpl{"test", db, "migration-project-id", profiles.SourceProfile{}, profiles.TargetProfile{}}
+	commonInfoSchema := common.InfoSchemaImpl{}
+	commonInfoSchema.SetRowStats(conv, isi)
 	assert.Equal(t, int64(5), conv.Stats.Rows["test1"])
 	assert.Equal(t, int64(142), conv.Stats.Rows["test2"])
 	assert.Equal(t, int64(0), conv.Unexpecteds())
@@ -452,4 +654,57 @@ func mkMockDB(t *testing.T, ms []mockSpec) *sql.DB {
 		}
 	}
 	return db
+}
+
+func TestGetConstraints_CheckConstraintsTableExists(t *testing.T) {
+	ms := []mockSpec{
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			cols:  []string{"COUNT(*)"},
+			rows:  [][]driver.Value{{1}},
+		},
+		{
+			query: regexp.QuoteMeta(`SELECT DISTINCT COALESCE(k.COLUMN_NAME,'') AS COLUMN_NAME,t.CONSTRAINT_NAME, t.CONSTRAINT_TYPE, COALESCE(c.CHECK_CLAUSE, '') AS CHECK_CLAUSE
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t
+            LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
+            ON t.CONSTRAINT_NAME = k.CONSTRAINT_NAME 
+            AND t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA 
+            AND t.TABLE_NAME = k.TABLE_NAME
+            LEFT JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS AS c
+            ON t.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+	    AND t.TABLE_SCHEMA = c.CONSTRAINT_SCHEMA
+            WHERE t.TABLE_SCHEMA = ? 
+            AND t.TABLE_NAME = ?;`),
+			args: []driver.Value{"test_schema", "test_table"},
+			cols: []string{"COLUMN_NAME", "CONSTRAINT_NAME", "CONSTRAINT_TYPE", "CHECK_CLAUSE"},
+			rows: [][]driver.Value{{"column1", "PRIMARY", "PRIMARY KEY", ""}, {"column2", "check_name", "CHECK", "(column2 > 0)"}},
+		},
+	}
+	db := mkMockDB(t, ms)
+	isi := InfoSchemaImpl{Db: db}
+	conv := &internal.Conv{}
+
+	primaryKeys, checkKeys, m, err := isi.GetConstraints(conv, common.SchemaAndName{Schema: "test_schema", Name: "test_table"})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"column1"}, primaryKeys)
+	assert.Equal(t, len(checkKeys), 1)
+	assert.Equal(t, checkKeys[0].Name, "check_name")
+	assert.Equal(t, checkKeys[0].Expr, "(column2 > 0)")
+	assert.NotNil(t, m)
+}
+
+func TestGetConstraints_CheckConstraintsTableAbsent(t *testing.T) {
+	ms := []mockSpec{
+		{
+			query: regexp.QuoteMeta(`SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA' ) AND TABLE_NAME = 'CHECK_CONSTRAINTS';`),
+			cols:  []string{"COUNT(*)"},
+			rows:  [][]driver.Value{{0}},
+		},
+	}
+	db := mkMockDB(t, ms)
+	isi := InfoSchemaImpl{Db: db}
+	conv := &internal.Conv{}
+
+	_, _, _, err := isi.GetConstraints(conv, common.SchemaAndName{Schema: "your_schema", Name: "your_table"})
+	assert.Error(t, err)
 }

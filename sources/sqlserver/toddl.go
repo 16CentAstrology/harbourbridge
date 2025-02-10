@@ -16,9 +16,11 @@
 package sqlserver
 
 import (
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 // ToDdlImpl sql server specific implementation for ToDdl.
@@ -29,13 +31,18 @@ type ToDdlImpl struct {
 // mods) into a Spanner type. This is the core source-to-Spanner type
 // mapping.  toSpannerType returns the Spanner type and a list of type
 // conversion issues encountered.
-func (tdi ToDdlImpl) ToSpannerType(conv *internal.Conv, columnType schema.Type) (ddl.Type, []internal.SchemaIssue) {
-	ty, issues := toSpannerTypeInternal(columnType.Name, "", columnType.Mods)
+func (tdi ToDdlImpl) ToSpannerType(conv *internal.Conv, spType string, srcType schema.Type, isPk bool) (ddl.Type, []internal.SchemaIssue) {
+	ty, issues := toSpannerTypeInternal(srcType, spType)
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
+		var pg_issues []internal.SchemaIssue
+		ty, pg_issues = common.ToPGDialectType(ty, isPk)
+		issues = append(issues, pg_issues...)
+	}
 	return ty, issues
 }
 
-func ToSpannerTypeWeb(srcType string, spType string, mods []int64) (ddl.Type, []internal.SchemaIssue) {
-	return toSpannerTypeInternal(srcType, spType, mods)
+func (tdi ToDdlImpl) GetColumnAutoGen(conv *internal.Conv, autoGenCol ddl.AutoGenCol, colId string, tableId string) (*ddl.AutoGenCol, error) {
+	return nil, nil
 }
 
 // toSpannerTypeInternal defines the mapping of source types into Spanner
@@ -47,8 +54,8 @@ func ToSpannerTypeWeb(srcType string, spType string, mods []int64) (ddl.Type, []
 // then it will be used to build the returned ddl.Type. If not, the default
 // Spanner type for this source type will be used.
 
-func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Type, []internal.SchemaIssue) {
-	switch srcType {
+func toSpannerTypeInternal(srcType schema.Type, spType string) (ddl.Type, []internal.SchemaIssue) {
+	switch srcType.Name {
 	case "bigint":
 		switch spType {
 		case ddl.String:
@@ -67,12 +74,21 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 		default:
 			return ddl.Type{Name: ddl.Int64}, []internal.SchemaIssue{internal.Widened}
 		}
-	case "float", "real":
+	case "real":
+		switch spType {
+		case ddl.String:
+			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, []internal.SchemaIssue{internal.Widened}
+		case ddl.Float64:
+			return ddl.Type{Name: ddl.Float64}, []internal.SchemaIssue{internal.Widened}
+		default:
+			return ddl.Type{Name: ddl.Float32}, nil
+		}
+	case "float":
 		switch spType {
 		case ddl.String:
 			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, []internal.SchemaIssue{internal.Widened}
 		default:
-			return ddl.Type{Name: ddl.Float64}, []internal.SchemaIssue{internal.Widened}
+			return ddl.Type{Name: ddl.Float64}, nil
 		}
 	case "numeric", "decimal", "money", "smallmoney":
 		switch spType {
@@ -94,33 +110,33 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 	case "uniqueidentifier":
 		switch spType {
 		case ddl.Bytes:
-			if len(mods) > 0 && mods[0] > 0 {
-				return ddl.Type{Name: ddl.Bytes, Len: mods[0]}, nil
+			if len(srcType.Mods) > 0 && srcType.Mods[0] > 0 {
+				return ddl.Type{Name: ddl.Bytes, Len: srcType.Mods[0]}, nil
 			}
 			return ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, nil
 		default:
-			if len(mods) > 0 && mods[0] > 0 {
-				return ddl.Type{Name: ddl.String, Len: mods[0]}, nil
+			if len(srcType.Mods) > 0 && srcType.Mods[0] > 0 {
+				return ddl.Type{Name: ddl.String, Len: srcType.Mods[0]}, nil
 			}
 			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, nil
 		}
 	case "varchar", "char", "nvarchar", "nchar":
 		switch spType {
 		case ddl.Bytes:
-			if len(mods) > 0 && mods[0] > 0 {
-				return ddl.Type{Name: ddl.Bytes, Len: mods[0]}, nil
+			if len(srcType.Mods) > 0 && srcType.Mods[0] > 0 {
+				return ddl.Type{Name: ddl.Bytes, Len: srcType.Mods[0]}, nil
 			}
 			return ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, nil
 		default:
 			// Sets the source length only if it falls within the allowed length range in Spanner.
-			if len(mods) > 0 && mods[0] > 0 && mods[0] <= ddl.StringMaxLength {
-				return ddl.Type{Name: ddl.String, Len: mods[0]}, nil
+			if len(srcType.Mods) > 0 && srcType.Mods[0] > 0 && srcType.Mods[0] <= ddl.StringMaxLength {
+				return ddl.Type{Name: ddl.String, Len: srcType.Mods[0]}, nil
 			}
 			// Raises warning and sets length to MAX when -
 			// Source length is greater than maximum allowed length
 			// -OR-
 			// Source length is "-1" which represents MAX in SQL Server
-			if len(mods) > 0 && (mods[0] > ddl.StringMaxLength || mods[0] < 0) {
+			if len(srcType.Mods) > 0 && (srcType.Mods[0] > ddl.StringMaxLength || srcType.Mods[0] < 0) {
 				return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, []internal.SchemaIssue{internal.StringOverflow}
 			}
 			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, nil

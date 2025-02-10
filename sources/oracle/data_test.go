@@ -23,9 +23,9 @@ import (
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -37,33 +37,39 @@ type spannerData struct {
 
 func TestProcessDataRow(t *testing.T) {
 	tableName := "testtable"
-	cols := []string{"a", "b", "c", "d"}
+	tableId := "t1"
+	cols := []string{"a", "b", "c", "d", "e"}
+	colIds := []string{"c1", "c2", "c3", "c4", "c5"}
 	conv := buildConv(
 		ddl.CreateTable{
-			Name:     tableName,
-			ColNames: cols,
+			Name:   tableName,
+			Id:     tableId,
+			ColIds: colIds,
 			ColDefs: map[string]ddl.ColumnDef{
-				"a": {Name: "a", T: ddl.Type{Name: ddl.Float64}},
-				"b": {Name: "b", T: ddl.Type{Name: ddl.Int64}},
-				"c": {Name: "b", T: ddl.Type{Name: ddl.Timestamp}},
-				"d": {Name: "d", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
+				"c1": {Name: "a", Id: "c1", T: ddl.Type{Name: ddl.Float64}},
+				"c2": {Name: "b", Id: "c2", T: ddl.Type{Name: ddl.Int64}},
+				"c3": {Name: "c", Id: "c3", T: ddl.Type{Name: ddl.Timestamp}},
+				"c4": {Name: "d", Id: "c4", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
+				"c5": {Name: "e", Id: "c5", T: ddl.Type{Name: ddl.Float32}},
 			}},
 		schema.Table{
-			Name:     tableName,
-			ColNames: cols,
+			Name:   tableName,
+			Id:     tableId,
+			ColIds: colIds,
 			ColDefs: map[string]schema.Column{
-				"a": {Name: "a", Type: schema.Type{Name: "FLOAT"}},
-				"b": {Name: "b", Type: schema.Type{Name: "NUMER"}},
-				"c": {Name: "c", Type: schema.Type{Name: "TIMESTAMP(6)"}},
-				"d": {Name: "d", Type: schema.Type{Name: "CHAR", Mods: []int64{1}}},
+				"c1": {Name: "a", Id: "c1", Type: schema.Type{Name: "FLOAT"}},
+				"c2": {Name: "b", Id: "c2", Type: schema.Type{Name: "NUMER"}},
+				"c3": {Name: "c", Id: "c3", Type: schema.Type{Name: "TIMESTAMP(6)"}},
+				"c4": {Name: "d", Id: "c4", Type: schema.Type{Name: "CHAR", Mods: []int64{1}}},
+				"c5": {Name: "e", Id: "c5", Type: schema.Type{Name: "BINARY_FLOAT"}},
 			}})
 	conv.SetDataMode()
 	var rows []spannerData
 	conv.SetDataSink(func(table string, cols []string, vals []interface{}) {
 		rows = append(rows, spannerData{table: table, cols: cols, vals: vals})
 	})
-	ProcessDataRow(conv, tableName, cols, conv.SrcSchema[tableName], tableName, cols, conv.SpSchema[tableName], []string{"4.2", "6", "2022-01-19T09:34:06.47Z", "p"})
-	assert.Equal(t, []spannerData{{table: tableName, cols: cols, vals: []interface{}{float64(4.2), int64(6), getTime("2022-01-19T09:34:06.47Z"), "p"}}}, rows)
+	ProcessDataRow(conv, tableId, colIds, conv.SrcSchema[tableId], conv.SpSchema[tableId], []string{"4.2", "6", "2022-01-19T09:34:06.47Z", "p", "3.14"})
+	assert.Equal(t, []spannerData{{table: tableName, cols: cols, vals: []interface{}{float64(4.2), int64(6), getTime("2022-01-19T09:34:06.47Z"), "p", float32(3.14)}}}, rows)
 }
 
 func TestConvertData(t *testing.T) {
@@ -81,6 +87,7 @@ func TestConvertData(t *testing.T) {
 	}{
 		{"bytes", ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, "", string([]byte{137, 80}), []byte{0x89, 0x50}}, // need some other approach to testblob type
 		{"date", ddl.Type{Name: ddl.Date}, "", "2019-10-29", getDate("2019-10-29")},
+		{"binary_float", ddl.Type{Name: ddl.Float32}, "", "3.14", float32(3.14)},
 		{"float", ddl.Type{Name: ddl.Float64}, "", "42.6", float64(42.6)},
 		{"int", ddl.Type{Name: ddl.Int64}, "", "42", int64(42)},
 		{"string", ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, "VARCHAR2", "eh", "eh"},
@@ -90,23 +97,31 @@ func TestConvertData(t *testing.T) {
 		{"bool", ddl.Type{Name: ddl.Bool}, "CHAR(1)", "T", true},
 		{"arrayStr", ddl.Type{Name: ddl.String, IsArray: true}, "", "[\"CA\",\"CDSC\",\"DSCCS\"]", []spanner.NullString{{StringVal: "CA", Valid: true}, {StringVal: "CDSC", Valid: true}, {StringVal: "DSCCS", Valid: true}}},
 		{"arrayInt", ddl.Type{Name: ddl.Int64, IsArray: true}, "", "[1,2,3]", []spanner.NullInt64{{Int64: 1, Valid: true}, {Int64: 2, Valid: true}, {Int64: 3, Valid: true}}},
+		{"arrayBinaryFloat", ddl.Type{Name: ddl.Float32, IsArray: true}, "", "[1.5,0.00002,357657]", []spanner.NullFloat32{{Float32: 1.5, Valid: true}, {Float32: 0.00002, Valid: true}, {Float32: 357657, Valid: true}}},
 		{"arrayFloat", ddl.Type{Name: ddl.Float64, IsArray: true}, "", "[1.5,0.00002,357657]", []spanner.NullFloat64{{Float64: 1.5, Valid: true}, {Float64: 0.00002, Valid: true}, {Float64: 357657, Valid: true}}},
-		{"arrayFloat", ddl.Type{Name: ddl.Date, IsArray: true}, "", "[\"2022-04-12\", \"2022-11-12\", \"2022-09-12\"]", getDateArray()},
+		{"arrayDate", ddl.Type{Name: ddl.Date, IsArray: true}, "", "[\"2022-04-12\", \"2022-11-12\", \"2022-09-12\"]", getDateArray()},
 		{"object", ddl.Type{Name: ddl.JSON}, "OBJECT", "<PERSON_TYP><IDNO>1</IDNO><NAME>test</NAME><PHONE>123456</PHONE></PERSON_TYP>", outputJson},
 	}
 	tableName := "testtable"
 	for _, tc := range singleColTests {
 		col := "a"
+		colId := "c1"
+		tableId := "t1"
 		conv := buildConv(
 			ddl.CreateTable{
-				Name:     tableName,
-				ColNames: []string{col},
-				ColDefs:  map[string]ddl.ColumnDef{col: {Name: col, T: tc.ty, NotNull: false}},
-				Pks:      []ddl.IndexKey{}},
-			schema.Table{Name: tableName, ColNames: []string{col}, ColDefs: map[string]schema.Column{col: {Type: schema.Type{Name: tc.srcTy}}}})
+				Name:        tableName,
+				Id:          tableId,
+				ColIds:      []string{colId},
+				ColDefs:     map[string]ddl.ColumnDef{colId: {Name: col, Id: colId, T: tc.ty, NotNull: false}},
+				PrimaryKeys: []ddl.IndexKey{}},
+			schema.Table{
+				Name:    tableName,
+				Id:      tableId,
+				ColIds:  []string{colId},
+				ColDefs: map[string]schema.Column{colId: {Name: col, Id: colId, Type: schema.Type{Name: tc.srcTy}}}})
 		conv.TimezoneOffset = "+05:30"
 		t.Run(tc.in, func(t *testing.T) {
-			at, ac, av, err := convertData(conv, tableName, []string{col}, conv.SrcSchema[tableName], tableName, []string{col}, conv.SpSchema[tableName], []string{tc.in})
+			at, ac, av, err := convertData(conv, tableId, []string{colId}, conv.SrcSchema[tableId], conv.SpSchema[tableId], []string{tc.in})
 			if tc.srcTy == "OBJECT" {
 				assert.Nil(t, err, tc.name)
 				assert.Equal(t, at, tableName, tc.name+": table mismatch")
@@ -121,49 +136,56 @@ func TestConvertData(t *testing.T) {
 
 func TestConvertsyntheticPKey(t *testing.T) {
 	syntheticPKeyTests := []struct {
-		name  string
-		cols  []string      // Input columns.
-		vals  []string      // Input values.
-		ecols []string      // Expected columns.
-		evals []interface{} // Expected values.
+		name   string
+		cols   []string // Input columns.
+		colIds []string
+		vals   []string      // Input values.
+		ecols  []string      // Expected columns.
+		evals  []interface{} // Expected values.
 	}{
 		{
-			name:  "Sequence 0",
-			cols:  []string{"a", "b", "c"},
-			vals:  []string{"6", "6.6", "t"},
-			ecols: []string{"a", "b", "c", "synth_id"},
-			evals: []interface{}{int64(6), float64(6.6), "t", "0"},
+			name:   "Sequence 0",
+			cols:   []string{"a", "b", "c"},
+			colIds: []string{"c1", "c2", "c3"},
+			vals:   []string{"6", "6.6", "t"},
+			ecols:  []string{"a", "b", "c", "synth_id"},
+			evals:  []interface{}{int64(6), float64(6.6), "t", "0"},
 		},
 		{
-			name:  "Sequence 1",
-			cols:  []string{"a"},
-			vals:  []string{"7"},
-			ecols: []string{"a", "synth_id"},
-			evals: []interface{}{int64(7), fmt.Sprintf("%d", int64(bits.Reverse64(1)))},
+			name:   "Sequence 1",
+			cols:   []string{"a"},
+			colIds: []string{"c1"},
+			vals:   []string{"7"},
+			ecols:  []string{"a", "synth_id"},
+			evals:  []interface{}{int64(7), fmt.Sprintf("%d", int64(bits.Reverse64(1)))},
 		},
 	}
 	tableName := "testtable"
+	tableId := "t1"
 	spTable := ddl.CreateTable{
-		Name:     tableName,
-		ColNames: []string{"a", "b", "c"},
+		Name:   tableName,
+		Id:     tableId,
+		ColIds: []string{"c1", "c2", "c3", "c4"},
 		ColDefs: map[string]ddl.ColumnDef{
-			"a": {Name: "a", T: ddl.Type{Name: ddl.Int64}},
-			"b": {Name: "b", T: ddl.Type{Name: ddl.Float64}},
-			"c": {Name: "c", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
+			"c1": {Name: "a", Id: "c1", T: ddl.Type{Name: ddl.Int64}},
+			"c2": {Name: "b", Id: "c2", T: ddl.Type{Name: ddl.Float64}},
+			"c3": {Name: "c", Id: "c3", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
+			"c4": {Name: "synth_id", Id: "c4", T: ddl.Type{Name: ddl.String, Len: 50}},
 		}}
 	srcTable := schema.Table{
-		Name:     tableName,
-		ColNames: []string{"a", "b", "c"},
+		Name:   tableName,
+		Id:     tableId,
+		ColIds: []string{"c1", "c2", "c3"},
 		ColDefs: map[string]schema.Column{
-			"a": {Type: schema.Type{Name: "NUMBER"}},
-			"b": {Type: schema.Type{Name: "FLOAT"}},
-			"c": {Type: schema.Type{Name: "CHAR", Mods: []int64{1}}},
+			"c1": {Name: "a", Id: "c1", Type: schema.Type{Name: "NUMBER"}},
+			"c2": {Name: "b", Id: "c2", Type: schema.Type{Name: "FLOAT"}},
+			"c3": {Name: "c", Id: "c3", Type: schema.Type{Name: "CHAR", Mods: []int64{1}}},
 		}}
 	conv := buildConv(spTable, srcTable)
-	conv.SyntheticPKeys[spTable.Name] = internal.SyntheticPKey{Col: "synth_id", Sequence: 0}
+	conv.SyntheticPKeys[tableId] = internal.SyntheticPKey{ColId: "c4", Sequence: 0}
 	for _, tc := range syntheticPKeyTests {
 		t.Run(tc.name, func(t *testing.T) {
-			atable, acols, avals, err := convertData(conv, srcTable.Name, tc.cols, conv.SrcSchema[tableName], spTable.Name, tc.cols, conv.SpSchema[tableName], tc.vals)
+			atable, acols, avals, err := convertData(conv, tableId, tc.colIds, conv.SrcSchema[tableId], conv.SpSchema[tableId], tc.vals)
 			checkResults(t, atable, acols, avals, err, tableName, tc.ecols, tc.evals, tc.name)
 		})
 	}
@@ -171,62 +193,73 @@ func TestConvertsyntheticPKey(t *testing.T) {
 
 func TestConvertMultiColData(t *testing.T) {
 	multiColTests := []struct {
-		name  string
-		cols  []string      // Input columns.
-		vals  []string      // Input values.
-		ecols []string      // Expected columns.
-		evals []interface{} // Expected values.
+		name   string
+		cols   []string // Input columns.
+		colIds []string
+		vals   []string      // Input values.
+		ecols  []string      // Expected columns.
+		evals  []interface{} // Expected values.
 	}{
 		{
-			name:  "Cols in order",
-			cols:  []string{"a", "b", "c"},
-			vals:  []string{"6", "6.6", "1"},
-			ecols: []string{"a", "b", "c"},
-			evals: []interface{}{int64(6), float64(6.6), "1"},
+			name:   "Cols in order",
+			cols:   []string{"a", "b", "c", "d"},
+			colIds: []string{"c1", "c2", "c3", "c4"},
+			vals:   []string{"6", "6.6", "1", "3.14"},
+			ecols:  []string{"a", "b", "c", "d"},
+			evals:  []interface{}{int64(6), float64(6.6), "1", float32(3.14)},
 		},
 		{
-			name:  "Cols out of order",
-			cols:  []string{"b", "c", "a"},
-			vals:  []string{"6.6", "1", "6"},
-			ecols: []string{"b", "c", "a"},
-			evals: []interface{}{float64(6.6), "1", int64(6)},
+			name:   "Cols out of order",
+			cols:   []string{"b", "c", "d", "a"},
+			colIds: []string{"c2", "c3", "c4", "c1"},
+			vals:   []string{"6.6", "1", "3.14", "6"},
+			ecols:  []string{"b", "c", "d", "a"},
+			evals:  []interface{}{float64(6.6), "1", float32(3.14), int64(6)},
 		},
 		{
-			name:  "Null column",
-			cols:  []string{"a", "b", "c"},
-			vals:  []string{"6", "NULL", "1"},
-			ecols: []string{"a", "c"},
-			evals: []interface{}{int64(6), "1"},
+			name:   "Null column",
+			cols:   []string{"a", "b", "c"},
+			colIds: []string{"c1", "c2", "c3"},
+			vals:   []string{"6", "NULL", "1"},
+			ecols:  []string{"a", "c"},
+			evals:  []interface{}{int64(6), "1"},
 		},
 		{
-			name:  "Missing columns",
-			cols:  []string{"a"},
-			vals:  []string{"6"},
-			ecols: []string{"a"},
-			evals: []interface{}{int64(6)},
+			name:   "Missing columns",
+			cols:   []string{"a"},
+			colIds: []string{"c1"},
+			vals:   []string{"6"},
+			ecols:  []string{"a"},
+			evals:  []interface{}{int64(6)},
 		},
 	}
 	tableName := "testtable"
+	tableId := "t1"
+	colIds := []string{"c1", "c2", "c3", "c4"}
 	spTable := ddl.CreateTable{
-		Name:     tableName,
-		ColNames: []string{"a", "b", "c"},
+		Name:   tableName,
+		Id:     tableId,
+		ColIds: colIds,
 		ColDefs: map[string]ddl.ColumnDef{
-			"a": {Name: "a", T: ddl.Type{Name: ddl.Int64}},
-			"b": {Name: "b", T: ddl.Type{Name: ddl.Float64}},
-			"c": {Name: "c", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
+			"c1": {Name: "a", Id: "c1", T: ddl.Type{Name: ddl.Int64}},
+			"c2": {Name: "b", Id: "c2", T: ddl.Type{Name: ddl.Float64}},
+			"c3": {Name: "c", Id: "c3", T: ddl.Type{Name: ddl.String, Len: int64(1)}},
+			"c4": {Name: "d", Id: "c4", T: ddl.Type{Name: ddl.Float32}},
 		}}
 	srcTable := schema.Table{
-		Name:     tableName,
-		ColNames: []string{"a", "b", "c"},
+		Name:   tableName,
+		Id:     tableId,
+		ColIds: colIds,
 		ColDefs: map[string]schema.Column{
-			"a": {Type: schema.Type{Name: "NUMBER", Mods: []int64{5}}},
-			"b": {Type: schema.Type{Name: "FLOAT"}},
-			"c": {Type: schema.Type{Name: "CHAR", Mods: []int64{1}}},
+			"c1": {Name: "a", Id: "c1", Type: schema.Type{Name: "NUMBER", Mods: []int64{5}}},
+			"c2": {Name: "b", Id: "c2", Type: schema.Type{Name: "FLOAT"}},
+			"c3": {Name: "c", Id: "c3", Type: schema.Type{Name: "CHAR", Mods: []int64{1}}},
+			"c4": {Name: "d", Id: "c4", Type: schema.Type{Name: "BINARY_FLOAT"}},
 		}}
 	for _, tc := range multiColTests {
 		t.Run(tc.name, func(t *testing.T) {
 			conv := buildConv(spTable, srcTable)
-			atable, acols, avals, err := convertData(conv, srcTable.Name, tc.cols, conv.SrcSchema[tableName], spTable.Name, tc.cols, conv.SpSchema[tableName], tc.vals)
+			atable, acols, avals, err := convertData(conv, tableId, tc.colIds, conv.SrcSchema[tableId], conv.SpSchema[tableId], tc.vals)
 			checkResults(t, atable, acols, avals, err, tableName, tc.ecols, tc.evals, tc.name)
 		})
 	}
@@ -234,47 +267,55 @@ func TestConvertMultiColData(t *testing.T) {
 
 func TestConvertError(t *testing.T) {
 	errorTests := []struct {
-		name string
-		cols []string // Input columns.
-		vals []string // Input values.
+		name   string
+		cols   []string // Input columns.
+		colIds []string
+		vals   []string // Input values.
 	}{
 		{
-			name: "Error in int64",
-			cols: []string{"a", "b", "c"},
-			vals: []string{" 6", "6.6", "true"},
+			name:   "Error in int64",
+			cols:   []string{"a", "b", "c"},
+			colIds: []string{"c1", "c2", "c3"},
+			vals:   []string{" 6", "6.6", "true"},
 		},
 		{
-			name: "Error in float64",
-			cols: []string{"a", "b", "c"},
-			vals: []string{"6", "6.6e", "true"},
+			name:   "Error in float64",
+			cols:   []string{"a", "b", "c"},
+			colIds: []string{"c1", "c2", "c3"},
+			vals:   []string{"6", "6.6e", "true"},
 		},
 		{
-			name: "Error in timestamp",
-			cols: []string{"a", "b", "c"},
-			vals: []string{"6", "6.6", "2022-01-199:34:06.47Z"},
+			name:   "Error in timestamp",
+			cols:   []string{"a", "b", "c"},
+			colIds: []string{"c1", "c2", "c3"},
+			vals:   []string{"6", "6.6", "2022-01-199:34:06.47Z"},
 		},
 	}
 	tableName := "testtable"
+	tableId := "t1"
+	colIds := []string{"c1", "c2", "c3"}
 	spTable := ddl.CreateTable{
-		Name:     tableName,
-		ColNames: []string{"a", "b", "c"},
+		Name:   tableName,
+		Id:     tableId,
+		ColIds: colIds,
 		ColDefs: map[string]ddl.ColumnDef{
-			"a": {Name: "a", T: ddl.Type{Name: ddl.Int64}},
-			"b": {Name: "b", T: ddl.Type{Name: ddl.Float64}},
-			"c": {Name: "c", T: ddl.Type{Name: ddl.Timestamp}},
+			"c1": {Name: "a", Id: "c1", T: ddl.Type{Name: ddl.Int64}},
+			"c2": {Name: "b", Id: "c2", T: ddl.Type{Name: ddl.Float64}},
+			"c3": {Name: "c", Id: "c3", T: ddl.Type{Name: ddl.Timestamp}},
 		}}
 	srcTable := schema.Table{
-		Name:     tableName,
-		ColNames: []string{"a", "b", "c"},
+		Name:   tableName,
+		Id:     tableId,
+		ColIds: colIds,
 		ColDefs: map[string]schema.Column{
-			"a": {Type: schema.Type{Name: "NUMBER"}},
-			"b": {Type: schema.Type{Name: "FLOAT"}},
-			"c": {Type: schema.Type{Name: "TIMESTAMP(6)"}},
+			"c1": {Name: "a", Id: "c1", Type: schema.Type{Name: "NUMBER"}},
+			"c2": {Name: "b", Id: "c2", Type: schema.Type{Name: "FLOAT"}},
+			"c3": {Name: "c", Id: "c3", Type: schema.Type{Name: "TIMESTAMP(6)"}},
 		}}
 	for _, tc := range errorTests {
 		t.Run(tc.name, func(t *testing.T) {
 			conv := buildConv(spTable, srcTable)
-			_, _, _, err := convertData(conv, srcTable.Name, tc.cols, conv.SrcSchema[tableName], spTable.Name, tc.cols, conv.SpSchema[tableName], tc.vals)
+			_, _, _, err := convertData(conv, tableId, tc.colIds, conv.SrcSchema[tableId], conv.SpSchema[tableId], tc.vals)
 			assert.NotNil(t, err, tc.name)
 		})
 	}
@@ -288,8 +329,8 @@ func checkResults(t *testing.T, atable string, acols []string, avals []interface
 
 func buildConv(spTable ddl.CreateTable, srcTable schema.Table) *internal.Conv {
 	conv := internal.MakeConv()
-	conv.SpSchema[spTable.Name] = spTable
-	conv.SrcSchema[srcTable.Name] = srcTable
+	conv.SpSchema[spTable.Id] = spTable
+	conv.SrcSchema[srcTable.Id] = srcTable
 	return conv
 }
 

@@ -45,6 +45,7 @@ const (
 	ORACLE string = "oracle"
 
 	// Target db for which schema is being generated.
+	// This can be removed once the support for global flags is removed.
 	TargetSpanner              string = "spanner"
 	TargetExperimentalPostgres string = "experimental_postgres"
 
@@ -53,7 +54,7 @@ const (
 	DIALECT_GOOGLESQL  string = "google_standard_sql"
 
 	// Temp directory name to write data which we cleanup at the end.
-	HB_TMP_DIR string = "harbourbridge_tmp_data"
+	SMT_TMP_DIR string = "spanner_migration_tool_tmp_data"
 
 	// Information on what conversion is happening (schema conv or data conv)
 	SchemaConv string = "schema_conv"
@@ -63,9 +64,71 @@ const (
 	MigrationMetadataKey string = "cloud-spanner-migration-metadata"
 
 	// Scheme used for GCS paths
-	GCS_SCHEME string = "gs"
+	GCS_SCHEME      string = "gs"
+	GCS_FILE_PREFIX string = "gs://"
 
+	// File upload prefix for dump and session load.
+	UPLOAD_FILE_DIR string = "upload-file"
 	// Rule types
 	GlobalDataTypeChange = "global_datatype_change"
 	AddIndex             = "add_index"
+	EditColumnMaxLength  = "edit_column_max_length"
+	AddShardIdPrimaryKey = "add_shard_id_primary_key"
+	// bulk migration type
+	BULK_MIGRATION = "bulk"
+	// dataflow migration type
+	DATAFLOW_MIGRATION = "dataflow"
+	// DMS migration type
+	DMS_MIGRATION = "dms"
+
+	SESSION_FILE = "sessionFile"
+
+	// Default shardId
+	DEFAULT_SHARD_ID string = "smt-default"
+	// Metadata database name
+	METADATA_DB string = "spannermigrationtool_metadata"
+	// Migration types
+	MINIMAL_DOWNTIME_MIGRATION = "minimal_downtime"
+	// Job Resource Types
+	DATAFLOW_RESOURCE         string = "dataflow"
+	PUBSUB_RESOURCE           string = "pubsub"
+	DLQ_PUBSUB_RESOURCE       string = "dlq_pubsub"
+	PUBSUB_TOPIC_RESOURCE     string = "pubsub_topic"
+	DLQ_PUBSUB_TOPIC_RESOURCE string = "dlq_pubsub_topic"
+	PUBSUB_SUB_RESOURCE       string = "pubsub_sub"
+	DLQ_PUBSUB_SUB_RESOURCE   string = "dlq_pubsub_sub"
+	MONITORING_RESOURCE       string = "monitoring"
+	AGG_MONITORING_RESOURCE   string = "aggregated_monitoring"
+	DATASTREAM_RESOURCE       string = "datastream"
+	GCS_RESOURCE              string = "gcs"
+	// Metadata table names
+	SMT_JOB_TABLE      string = "SMT_JOB"
+	SMT_RESOURCE_TABLE string = "SMT_RESOURCE"
+	// Auto Generated Keys
+	UUID           string = "UUID"
+	SEQUENCE       string = "Sequence"
+	AUTO_INCREMENT string = "Auto Increment"
+	// Default gcs path of the Dataflow template.
+	DEFAULT_TEMPLATE_PATH string = "gs://dataflow-templates/latest/flex/Cloud_Datastream_to_Spanner"
+
+	// FK Actions
+	FK_NO_ACTION   string = "NO ACTION"
+	FK_CASCADE     string = "CASCADE"
+	FK_SET_DEFAULT string = "SET DEFAULT"
+	FK_SET_NULL    string = "SET NULL"
+	FK_RESTRICT    string = "RESTRICT"
+
+	// GCS PUBSUB MODES
+	REGULAR_GCS string = "data"
+	DLQ_GCS     string = "dlq"
+
+	// VerifyExpresions API
+	CHECK_EXPRESSION   = "CHECK"
+	DEFAULT_EXPRESSION = "DEFAULT"
+	DEFAULT_GENERATED  = "DEFAULT_GENERATED"
+	TEMP_DB            = "smt-staging-db"
+	DB_URI             = "projects/%s/instances/%s/databases/%s"
+
+	// Regex for matching database collation
+	DB_COLLATION_REGEX = `(_[a-zA-Z0-9]+\\|\\)`
 )

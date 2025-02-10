@@ -16,10 +16,11 @@
 package dynamodb
 
 import (
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 // ToDdl implementation for DynamoDB
@@ -31,16 +32,22 @@ type ToDdlImpl struct {
 // mods) into a Spanner type. This is the core source-to-Spanner type
 // mapping.  toSpannerType returns the Spanner type and a list of type
 // conversion issues encountered.
-func (tdi ToDdlImpl) ToSpannerType(conv *internal.Conv, columnType schema.Type) (ddl.Type, []internal.SchemaIssue) {
-	ty, issues := toSpannerTypeInternal(conv, columnType.Name)
-	if conv.TargetDb == constants.TargetExperimentalPostgres {
-		ty = overrideExperimentalType(ty)
+func (tdi ToDdlImpl) ToSpannerType(conv *internal.Conv, spType string, srcType schema.Type, isPk bool) (ddl.Type, []internal.SchemaIssue) {
+	ty, issues := toSpannerTypeInternal(conv, srcType)
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
+		var pg_issues []internal.SchemaIssue
+		ty, pg_issues = common.ToPGDialectType(ty, isPk)
+		issues = append(issues, pg_issues...)
 	}
 	return ty, issues
 }
 
-func toSpannerTypeInternal(conv *internal.Conv, id string) (ddl.Type, []internal.SchemaIssue) {
-	switch id {
+func (tdi ToDdlImpl) GetColumnAutoGen(conv *internal.Conv, autoGenCol ddl.AutoGenCol, colId string, tableId string) (*ddl.AutoGenCol, error) {
+	return nil, nil
+}
+
+func toSpannerTypeInternal(conv *internal.Conv, srcType schema.Type) (ddl.Type, []internal.SchemaIssue) {
+	switch srcType.Name {
 	case typeNumber:
 		return ddl.Type{Name: ddl.Numeric}, nil
 	case typeNumberString, typeString, typeList, typeMap:
@@ -58,12 +65,4 @@ func toSpannerTypeInternal(conv *internal.Conv, id string) (ddl.Type, []internal
 	default:
 		return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, []internal.SchemaIssue{internal.NoGoodType}
 	}
-}
-
-// Override the types to map to experimental postgres types.
-func overrideExperimentalType(originalType ddl.Type) ddl.Type {
-	if originalType.IsArray {
-		return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
-	}
-	return originalType
 }

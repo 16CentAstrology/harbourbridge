@@ -24,10 +24,14 @@ import (
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/logger"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/profiles"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap"
 )
 
 type spannerData struct {
@@ -43,7 +47,12 @@ const (
 	ALL_TYPES_CSV string = ALL_TYPES_TABLE + ".csv"
 	SINGERS_1_CSV string = SINGERS_TABLE + "_1.csv"
 	SINGERS_2_CSV string = SINGERS_TABLE + "_2.csv"
+	MANIFEST      string = "manifest.json"
 )
+
+func init() {
+	logger.Log = zap.NewNop()
+}
 
 func getManifestTables() []utils.ManifestTable {
 	return []utils.ManifestTable{
@@ -102,11 +111,27 @@ func cleanupCSVs() {
 	}
 }
 
+func writeManifest(t *testing.T) {
+	data := "[{\"table_name\":\"singers\",\"file_patterns\": [\"singers_1.csv\"]}]"
+	f, err := os.Create(MANIFEST)
+	if err != nil {
+		t.Fatalf("Could not create %s: %v", MANIFEST, err)
+	}
+	if _, err := f.WriteString(data); err != nil {
+		t.Fatalf("Could not write to %s: %v", MANIFEST, err)
+	}
+}
+
+func cleanupManifest() {
+	os.Remove(MANIFEST)
+}
+
 func TestSetRowStats(t *testing.T) {
+	csv := CsvImpl{}
 	conv := buildConv(getCreateTable())
 	writeCSVs(t)
 	defer cleanupCSVs()
-	SetRowStats(conv, getManifestTables(), ',')
+	csv.SetRowStats(conv, getManifestTables(), ',')
 	assert.Equal(t, map[string]int64{ALL_TYPES_TABLE: 1, SINGERS_TABLE: 2}, conv.Stats.Rows)
 }
 
@@ -122,7 +147,8 @@ func TestProcessCSV(t *testing.T) {
 		func(table string, cols []string, vals []interface{}) {
 			rows = append(rows, spannerData{table: table, cols: cols, vals: vals})
 		})
-	err := ProcessCSV(conv, tables, "", ',')
+	csv := CsvImpl{}
+	err := csv.ProcessCSV(conv, tables, "", ',')
 	assert.Nil(t, err)
 	assert.Equal(t, []spannerData{
 		{
@@ -133,6 +159,35 @@ func TestProcessCSV(t *testing.T) {
 		{table: SINGERS_TABLE, cols: []string{"SingerId", "FirstName", "LastName"}, vals: []interface{}{int64(1), "fn1", "ln1"}},
 		{table: SINGERS_TABLE, cols: []string{"SingerId", "FirstName", "LastName"}, vals: []interface{}{int64(2), "fn2", "ln2"}},
 	}, rows)
+}
+
+func TestGetCSVFilesWithoutManifest(t *testing.T) {
+	writeCSVs(t)
+	defer cleanupCSVs()
+
+	conv := buildConv(getCreateSingersTable())
+	csv := CsvImpl{}
+	tables, err := csv.GetCSVFiles(conv, profiles.SourceProfile{File: profiles.SourceProfileFile{Path: "singers.csv"}})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(tables))
+	assert.Equal(t, "singers", tables[0].Table_name)
+	assert.Equal(t, []string{fmt.Sprintf("%s.csv", "singers")}, tables[0].File_patterns)
+}
+
+func TestGetCSVFilesWithManifest(t *testing.T) {
+	writeCSVs(t)
+	defer cleanupCSVs()
+	writeManifest(t)
+	defer cleanupManifest()
+
+	conv := buildConv(getCreateSingersTable())
+	addSrcTableToConv(conv)
+	csv := CsvImpl{}
+	tables, err := csv.GetCSVFiles(conv, profiles.SourceProfile{Csv: profiles.SourceProfileCsv{Manifest: MANIFEST}})
+	assert.NoError(t, err)
+	assert.Equal(t, 1, len(tables))
+	assert.Equal(t, "singers", tables[0].Table_name)
+	assert.Equal(t, []string{fmt.Sprintf("%s.csv", "singers_1")}, tables[0].File_patterns)
 }
 
 func TestConvertData(t *testing.T) {
@@ -146,6 +201,7 @@ func TestConvertData(t *testing.T) {
 		{"bool", ddl.Type{Name: ddl.Bool}, "true", true},
 		{"bytes", ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, string([]byte{137, 80}), []byte{0x89, 0x50}},
 		{"date", ddl.Type{Name: ddl.Date}, "2019-10-29", getDate("2019-10-29")},
+		{"float32", ddl.Type{Name: ddl.Float32}, "3.14", float32(3.14)},
 		{"float64", ddl.Type{Name: ddl.Float64}, "42.6", float64(42.6)},
 		{"int64", ddl.Type{Name: ddl.Int64}, "42", int64(42)},
 		{"numeric", ddl.Type{Name: ddl.Numeric}, "42.6", *big.NewRat(426, 10)},
@@ -154,15 +210,18 @@ func TestConvertData(t *testing.T) {
 		{"json", ddl.Type{Name: ddl.JSON}, "{\"key1\": \"value1\"}", "{\"key1\": \"value1\"}"},
 		{"int_array", ddl.Type{Name: ddl.Int64, IsArray: true}, "{1,2,NULL}", []spanner.NullInt64{{Int64: int64(1), Valid: true}, {Int64: int64(2), Valid: true}, {Valid: false}}},
 		{"string_array", ddl.Type{Name: ddl.String, IsArray: true}, "[ab,cd]", []spanner.NullString{{StringVal: "ab", Valid: true}, {StringVal: "cd", Valid: true}}},
-		{"float_array", ddl.Type{Name: ddl.Float64, IsArray: true}, "{1.3,2.5}", []spanner.NullFloat64{{Float64: float64(1.3), Valid: true}, {Float64: float64(2.5), Valid: true}}},
+		{"float32_array", ddl.Type{Name: ddl.Float32, IsArray: true}, "{1.3,2.5}", []spanner.NullFloat32{{Float32: float32(1.3), Valid: true}, {Float32: float32(2.5), Valid: true}}},
+		{"float64_array", ddl.Type{Name: ddl.Float64, IsArray: true}, "{1.3,2.5}", []spanner.NullFloat64{{Float64: float64(1.3), Valid: true}, {Float64: float64(2.5), Valid: true}}},
 		{"numeric_array", ddl.Type{Name: ddl.Numeric, IsArray: true}, "[1.7]", []spanner.NullNumeric{{Numeric: *big.NewRat(17, 10), Valid: true}}},
 	}
 	tableName := "testtable"
 	for _, tc := range singleColTests {
 		col := "a"
+		colId := "c1"
 		conv := buildConv([]ddl.CreateTable{{
 			Name:    tableName,
-			ColDefs: map[string]ddl.ColumnDef{col: ddl.ColumnDef{Name: col, T: tc.ty}}}})
+			Id:      "t1",
+			ColDefs: map[string]ddl.ColumnDef{colId: ddl.ColumnDef{Name: col, Id: colId, T: tc.ty}}}})
 		_, av, err := convertData(conv, "", tableName, []string{col}, []string{tc.in})
 		// NULL scenario.
 		if tc.ev == nil {
@@ -207,39 +266,73 @@ func TestConvertData(t *testing.T) {
 	}
 }
 
-func getCreateTable() []ddl.CreateTable {
+func getCreateSingersTable() []ddl.CreateTable {
 	return []ddl.CreateTable{
 		{
-			Name:     ALL_TYPES_TABLE,
-			ColNames: []string{"bool_col", "byte_col", "date_col", "float_col", "int_col", "numeric_col", "string_col", "timestamp_col", "json_col"},
+			Name:   SINGERS_TABLE,
+			Id:     "t2",
+			ColIds: []string{"c10", "c11", "c12"},
 			ColDefs: map[string]ddl.ColumnDef{
-				"bool_col":      {Name: "bool_col", T: ddl.Type{Name: ddl.Bool}},
-				"byte_col":      {Name: "byte_col", T: ddl.Type{Name: ddl.Bytes}},
-				"date_col":      {Name: "date_col", T: ddl.Type{Name: ddl.Date}},
-				"float_col":     {Name: "float_col", T: ddl.Type{Name: ddl.Float64}},
-				"int_col":       {Name: "int_col", T: ddl.Type{Name: ddl.Int64}},
-				"numeric_col":   {Name: "numeric_col", T: ddl.Type{Name: ddl.Numeric}},
-				"string_col":    {Name: "string_col", T: ddl.Type{Name: ddl.String}},
-				"timestamp_col": {Name: "timestamp_col", T: ddl.Type{Name: ddl.Timestamp}},
-				"json_col":      {Name: "json_col", T: ddl.Type{Name: ddl.JSON}},
-			},
-		},
-		{
-			Name:     SINGERS_TABLE,
-			ColNames: []string{"SingerId", "FirstName", "LastName"},
-			ColDefs: map[string]ddl.ColumnDef{
-				"SingerId":  {Name: "SingerId", T: ddl.Type{Name: ddl.Int64}},
-				"FirstName": {Name: "FirstName", T: ddl.Type{Name: ddl.String}},
-				"LastName":  {Name: "LastName", T: ddl.Type{Name: ddl.String}},
+				"c10": {Name: "SingerId", Id: "c10", T: ddl.Type{Name: ddl.Int64}},
+				"c11": {Name: "FirstName", Id: "c11", T: ddl.Type{Name: ddl.String}},
+				"c12": {Name: "LastName", Id: "c12", T: ddl.Type{Name: ddl.String}},
 			},
 		},
 	}
 }
 
+func getCreateTable() []ddl.CreateTable {
+	return []ddl.CreateTable{
+		{
+			Name:   ALL_TYPES_TABLE,
+			Id:     "t1",
+			ColIds: []string{"c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9"},
+			ColDefs: map[string]ddl.ColumnDef{
+				"c1": {Name: "bool_col", Id: "c1", T: ddl.Type{Name: ddl.Bool}},
+				"c2": {Name: "byte_col", Id: "c2", T: ddl.Type{Name: ddl.Bytes}},
+				"c3": {Name: "date_col", Id: "c3", T: ddl.Type{Name: ddl.Date}},
+				"c4": {Name: "float_col", Id: "c4", T: ddl.Type{Name: ddl.Float64}},
+				"c5": {Name: "int_col", Id: "c5", T: ddl.Type{Name: ddl.Int64}},
+				"c6": {Name: "numeric_col", Id: "c6", T: ddl.Type{Name: ddl.Numeric}},
+				"c7": {Name: "string_col", Id: "c7", T: ddl.Type{Name: ddl.String}},
+				"c8": {Name: "timestamp_col", Id: "c8", T: ddl.Type{Name: ddl.Timestamp}},
+				"c9": {Name: "json_col", Id: "c9", T: ddl.Type{Name: ddl.JSON}},
+			},
+		},
+		{
+			Name:   SINGERS_TABLE,
+			Id:     "t2",
+			ColIds: []string{"c10", "c11", "c12"},
+			ColDefs: map[string]ddl.ColumnDef{
+				"c10": {Name: "SingerId", Id: "c10", T: ddl.Type{Name: ddl.Int64}},
+				"c11": {Name: "FirstName", Id: "c11", T: ddl.Type{Name: ddl.String}},
+				"c12": {Name: "LastName", Id: "c12", T: ddl.Type{Name: ddl.String}},
+			},
+		},
+	}
+}
+
+func addSrcTableToConv(conv *internal.Conv) *internal.Conv {
+	srcSchema := map[string]schema.Table{
+		"singers": {
+			Name:   SINGERS_TABLE,
+			Id:     "t2",
+			ColIds: []string{"c10", "c11", "c12"},
+			ColDefs: map[string]schema.Column{
+				"c10": {Name: "SingerId", Id: "c10", Type: schema.Type{Name: ddl.Int64}},
+				"c11": {Name: "FirstName", Id: "c11", Type: schema.Type{Name: ddl.String}},
+				"c12": {Name: "LastName", Id: "c12", Type: schema.Type{Name: ddl.String}},
+			},
+		},
+	}
+	conv.SrcSchema = srcSchema
+	return conv
+}
+
 func buildConv(spTables []ddl.CreateTable) *internal.Conv {
 	conv := internal.MakeConv()
 	for _, spTable := range spTables {
-		conv.SpSchema[spTable.Name] = spTable
+		conv.SpSchema[spTable.Id] = spTable
 	}
 	return conv
 }

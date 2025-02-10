@@ -13,6 +13,7 @@ import { MatInputModule } from '@angular/material/input'
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations'
 import { SnackbarService } from 'src/app/services/snackbar/snackbar.service'
 import { MatSnackBarModule } from '@angular/material/snack-bar'
+import { MatDialog } from '@angular/material/dialog'
 
 const appRoutes: Routes = [{ path: 'workspace', component: WorkspaceComponent }]
 
@@ -35,7 +36,10 @@ describe('DirectConnectionComponent', () => {
         BrowserAnimationsModule,
         MatSnackBarModule,
       ],
-      providers: [SnackbarService],
+      providers: [
+        SnackbarService,
+        { provide: MatDialog, useValue: {} }
+      ],
     }).compileComponents()
   })
 
@@ -80,7 +84,7 @@ describe('DirectConnectionComponent', () => {
 
     let pass = component.connectForm.get('password')
     pass?.setValue('')
-    expect(pass?.invalid).toBeTruthy()
+    expect(pass?.invalid).toBeFalsy()
     pass?.setValue('23143')
     expect(pass?.invalid).toBeFalsy()
 
@@ -89,6 +93,12 @@ describe('DirectConnectionComponent', () => {
     expect(dbname?.invalid).toBeTruthy()
     dbname?.setValue('mysql')
     expect(dbname?.invalid).toBeFalsy()
+
+    let dialect = component.connectForm.get('dialect')
+    dialect?.setValue('')
+    expect(dialect?.invalid).toBeTruthy()
+    dialect?.setValue('postgresql')
+    expect(dialect?.invalid).toBeFalsy()
 
     // now every input is valid do form will be valid
     expect(component.connectForm.valid).toBeTruthy()
@@ -116,6 +126,7 @@ describe('DirectConnectionComponent', () => {
       userName: 'sa',
       password: 'password',
       dbName: 'database',
+      dialect: 'postgresql',
     })
     expect(component.connectForm.valid).toBeTruthy()
     fixture.detectChanges()

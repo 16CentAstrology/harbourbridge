@@ -40,8 +40,8 @@ import (
 	"google.golang.org/api/iterator"
 	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
 )
 
 var (
@@ -88,8 +88,8 @@ func TestMain(m *testing.M) {
 }
 
 func initIntegrationTests() (cleanup func()) {
-	projectID = os.Getenv("HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID")
-	instanceID = os.Getenv("HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID")
+	projectID = os.Getenv("SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID")
+	instanceID = os.Getenv("SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID")
 
 	ctx = context.Background()
 	flag.Parse() // Needed for testing.Short().
@@ -101,12 +101,12 @@ func initIntegrationTests() (cleanup func()) {
 	}
 
 	if projectID == "" {
-		log.Println("Integration tests skipped: HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID is missing")
+		log.Println("Integration tests skipped: SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID is missing")
 		return noop
 	}
 
 	if instanceID == "" {
-		log.Println("Integration tests skipped: HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID is missing")
+		log.Println("Integration tests skipped: SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID is missing")
 		return noop
 	}
 
@@ -244,7 +244,7 @@ func RunStreamingMigration(t *testing.T, args string, projectID string, client *
 	// is because file prefixes use `now` from here (the test function) and
 	// the generated time in the files uses a `now` inside the command, which
 	// can be different.
-	cmd := exec.Command("bash", "-c", fmt.Sprintf("go run github.com/cloudspannerecosystem/harbourbridge %v", args))
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("go run github.com/GoogleCloudPlatform/spanner-migration-tool %v", args))
 	var out, stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
@@ -323,9 +323,10 @@ func TestIntegration_DYNAMODB_Streaming_Command(t *testing.T) {
 	defer os.RemoveAll(tmpdir)
 
 	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.DYNAMODB, now)
+	g := utils.GetUtilInfoImpl{}
+	dbName, _ := g.GetDatabaseName(constants.DYNAMODB, now)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
+	filePrefix := filepath.Join(tmpdir, dbName)
 
 	client, err := spanner.NewClient(ctx, dbURI)
 	if err != nil {
@@ -333,7 +334,7 @@ func TestIntegration_DYNAMODB_Streaming_Command(t *testing.T) {
 	}
 	defer client.Close()
 
-	args := fmt.Sprintf(`schema-and-data -source=%s -prefix=%s -source-profile="enableStreaming=true" -target-profile="instance=%s,dbName=%s"`, constants.DYNAMODB, filePrefix, instanceID, dbName)
+	args := fmt.Sprintf(`schema-and-data -source=%s -prefix=%s -source-profile="enableStreaming=true" -target-profile="instance=%s,dbName=%s,project=%s"`, constants.DYNAMODB, filePrefix, instanceID, dbName, projectID)
 	err = RunStreamingMigration(t, args, projectID, client)
 	if err != nil {
 		t.Fatal(err)

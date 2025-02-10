@@ -16,10 +16,13 @@
 package mysql
 
 import (
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"fmt"
+
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 // ToDdlImpl MySQL specific implementation for ToDdl.
@@ -31,25 +34,53 @@ type ToDdlImpl struct {
 // mapping.  toSpannerType returns the Spanner type and a list of type
 // conversion issues encountered.
 // Functions below implement the common.ToDdl interface
-func (tdi ToDdlImpl) ToSpannerType(conv *internal.Conv, columnType schema.Type) (ddl.Type, []internal.SchemaIssue) {
-	ty, issues := toSpannerTypeInternal(columnType.Name, "", columnType.Mods)
-	if conv.TargetDb == constants.TargetExperimentalPostgres {
-		ty = overrideExperimentalType(columnType, ty)
-	} else {
-		if len(columnType.ArrayBounds) > 1 {
-			ty = ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
-			issues = append(issues, internal.MultiDimensionalArray)
-		}
-		ty.IsArray = len(columnType.ArrayBounds) == 1
+func (tdi ToDdlImpl) ToSpannerType(conv *internal.Conv, spType string, srcType schema.Type, isPk bool) (ddl.Type, []internal.SchemaIssue) {
+	ty, issues := toSpannerTypeInternal(srcType, spType)
+	if len(srcType.ArrayBounds) > 1 {
+		ty = ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
+		issues = append(issues, internal.MultiDimensionalArray)
+	} else if len(srcType.ArrayBounds) == 1 {
+		// This check has been added because we don't support Array<primitive type> to string conversions
+		// and Array datatype is currently not supported in datastream.
+		ty = ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
+		issues = append(issues, internal.ArrayTypeNotSupported)
+	}
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
+		var pg_issues []internal.SchemaIssue
+		ty, pg_issues = common.ToPGDialectType(ty, isPk)
+		issues = append(issues, pg_issues...)
 	}
 	return ty, issues
 }
-func ToSpannerTypeWeb(srcType string, spType string, mods []int64) (ddl.Type, []internal.SchemaIssue) {
-	return toSpannerTypeInternal(srcType, spType, mods)
+
+func (tdi ToDdlImpl) GetColumnAutoGen(conv *internal.Conv, autoGenCol ddl.AutoGenCol, colId string, tableId string) (*ddl.AutoGenCol, error) {
+	switch autoGenCol.GenerationType {
+	case constants.AUTO_INCREMENT:
+		sequenceId := ""
+		srcSequences := conv.SrcSequences
+		for seqId, seq := range srcSequences {
+			if seq.Name == autoGenCol.Name {
+				sequenceId = seqId
+			}
+		}
+		if sequenceId == "" {
+			return &ddl.AutoGenCol{}, fmt.Errorf("sequence corresponding to column auto generation not found")
+		}
+		spSequences := conv.SpSequences
+		sequence := spSequences[sequenceId]
+		sequence.ColumnsUsingSeq = map[string][]string{
+			tableId: {colId},
+		}
+		spSequences[sequenceId] = sequence
+		conv.SpSequences = spSequences
+		return &ddl.AutoGenCol{Name: conv.SpSequences[sequenceId].Name, GenerationType: constants.SEQUENCE}, nil
+	default:
+		return &ddl.AutoGenCol{}, fmt.Errorf("auto generation not supported")
+	}
 }
 
-func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Type, []internal.SchemaIssue) {
-	switch srcType {
+func toSpannerTypeInternal(srcType schema.Type, spType string) (ddl.Type, []internal.SchemaIssue) {
+	switch srcType.Name {
 	case "bool", "boolean":
 		switch spType {
 		case ddl.String:
@@ -67,7 +98,7 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 			return ddl.Type{Name: ddl.Int64}, []internal.SchemaIssue{internal.Widened}
 		default:
 			// tinyint(1) is a bool in MySQL
-			if len(mods) > 0 && mods[0] == 1 {
+			if len(srcType.Mods) > 0 && srcType.Mods[0] == 1 {
 				return ddl.Type{Name: ddl.Bool}, nil
 			}
 			return ddl.Type{Name: ddl.Int64}, []internal.SchemaIssue{internal.Widened}
@@ -83,8 +114,10 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 		switch spType {
 		case ddl.String:
 			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, []internal.SchemaIssue{internal.Widened}
-		default:
+		case ddl.Float64:
 			return ddl.Type{Name: ddl.Float64}, []internal.SchemaIssue{internal.Widened}
+		default:
+			return ddl.Type{Name: ddl.Float32}, nil
 		}
 	case "numeric", "decimal":
 		switch spType {
@@ -119,18 +152,21 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 		case ddl.String:
 			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, nil
 		default:
+			if len(srcType.Mods) > 0 && srcType.Mods[0] == 1 {
+				return ddl.Type{Name: ddl.Bool}, nil
+			}
 			return ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, nil
 		}
 	case "varchar", "char":
 		switch spType {
 		case ddl.Bytes:
-			if len(mods) > 0 {
-				return ddl.Type{Name: ddl.Bytes, Len: mods[0]}, nil
+			if len(srcType.Mods) > 0 {
+				return ddl.Type{Name: ddl.Bytes, Len: srcType.Mods[0]}, nil
 			}
 			return ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, nil
 		default:
-			if len(mods) > 0 {
-				return ddl.Type{Name: ddl.String, Len: mods[0]}, nil
+			if len(srcType.Mods) > 0 {
+				return ddl.Type{Name: ddl.String, Len: srcType.Mods[0]}, nil
 			}
 			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, nil
 		}
@@ -145,6 +181,8 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 		return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, nil
 	case "json":
 		switch spType {
+		case ddl.String:
+			return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, nil
 		case ddl.Bytes:
 			return ddl.Type{Name: ddl.Bytes, Len: ddl.MaxLength}, nil
 		default:
@@ -190,14 +228,4 @@ func toSpannerTypeInternal(srcType string, spType string, mods []int64) (ddl.Typ
 
 	}
 	return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}, []internal.SchemaIssue{internal.NoGoodType}
-}
-
-// Override the types to map to experimental postgres types.
-func overrideExperimentalType(columnType schema.Type, originalType ddl.Type) ddl.Type {
-	if len(columnType.ArrayBounds) > 0 {
-		return ddl.Type{Name: ddl.String, Len: ddl.MaxLength}
-	} else if columnType.Name == "json" {
-		return ddl.Type{Name: ddl.JSONB}
-	}
-	return originalType
 }

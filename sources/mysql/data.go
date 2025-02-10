@@ -24,24 +24,29 @@ import (
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/spanner"
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
 )
 
 // ProcessDataRow converts a row of data and writes it out to Spanner.
 // srcTable and srcCols are the source table and columns respectively,
 // and vals contains string data to be converted to appropriate types
 // to send to Spanner. ProcessDataRow is only called in DataMode.
-func ProcessDataRow(conv *internal.Conv, srcTable string, srcCols []string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable, vals []string) {
-	spTable, cvtCols, cvtVals, err := ConvertData(conv, srcTable, srcCols, srcSchema, spTable, spCols, spSchema, vals)
+func ProcessDataRow(conv *internal.Conv, tableId string, colIds []string, srcSchema schema.Table, spSchema ddl.CreateTable, vals []string, additionalAttributes internal.AdditionalDataAttributes) {
+	srcTableName := srcSchema.Name
+	srcCols := []string{}
+	for _, colId := range colIds {
+		srcCols = append(srcCols, srcSchema.ColDefs[colId].Name)
+	}
+	spTableName, cvtCols, cvtVals, err := ConvertData(conv, tableId, colIds, srcSchema, spSchema, vals, additionalAttributes)
 	if err != nil {
 		conv.Unexpected(fmt.Sprintf("Error while converting data: %s\n", err))
-		conv.StatsAddBadRow(srcTable, conv.DataMode())
-		conv.CollectBadRow(srcTable, srcCols, vals)
+		conv.StatsAddBadRow(srcTableName, conv.DataMode())
+		conv.CollectBadRow(srcTableName, srcCols, vals)
 	} else {
-		conv.WriteRow(srcTable, spTable, cvtCols, cvtVals)
+		conv.WriteRow(srcTableName, spTableName, cvtCols, cvtVals)
 	}
 }
 
@@ -49,14 +54,13 @@ func ProcessDataRow(conv *internal.Conv, srcTable string, srcCols []string, srcS
 // based on the Spanner and source DB schemas. Note that since entries
 // in vals may be empty, we also return the list of columns (empty
 // cols are dropped).
-func ConvertData(conv *internal.Conv, srcTable string, srcCols []string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable, vals []string) (string, []string, []interface{}, error) {
+func ConvertData(conv *internal.Conv, tableId string, colIds []string, srcSchema schema.Table, spSchema ddl.CreateTable, vals []string, additionalAttributes internal.AdditionalDataAttributes) (string, []string, []interface{}, error) {
 	var c []string
 	var v []interface{}
-	if len(spCols) != len(srcCols) || len(spCols) != len(vals) {
-		return "", []string{}, []interface{}{}, fmt.Errorf("ConvertData: spCols, srcCols and vals don't all have the same lengths: len(spCols)=%d, len(srcCols)=%d, len(vals)=%d", len(spCols), len(srcCols), len(vals))
+	if len(colIds) != len(vals) {
+		return "", []string{}, []interface{}{}, fmt.Errorf("ConvertData: colIds and vals don't all have the same lengths: len(colIds)=%d, len(vals)=%d", len(colIds), len(vals))
 	}
-	for i, spCol := range spCols {
-		srcCol := srcCols[i]
+	for i, colId := range colIds {
 		// Skip columns with 'NULL' values. When processing data rows from mysqldump, these values
 		// are represented as nil (by pingcap/tidb/types/parser_driver's ValueExpr), which is
 		// converted to the string '<nil>'. When processing data rows obtained from the MySQL driver,
@@ -64,11 +68,14 @@ func ConvertData(conv *internal.Conv, srcTable string, srcCols []string, srcSche
 		if vals[i] == "<nil>" || vals[i] == "NULL" {
 			continue
 		}
-		spColDef, ok1 := spSchema.ColDefs[spCol]
-		srcColDef, ok2 := srcSchema.ColDefs[srcCol]
+
+		spColDef, ok1 := spSchema.ColDefs[colId]
+		srcColDef, ok2 := srcSchema.ColDefs[colId]
 		if !ok1 || !ok2 {
-			return "", []string{}, []interface{}{}, fmt.Errorf("can't find Spanner and source-db schema for col %s", spCol)
+			return "", []string{}, []interface{}{}, fmt.Errorf("can't find Spanner and source-db schema for colId %s", colId)
 		}
+		spCol := spColDef.Name
+
 		var x interface{}
 		var err error
 		if spColDef.T.IsArray {
@@ -82,13 +89,18 @@ func ConvertData(conv *internal.Conv, srcTable string, srcCols []string, srcSche
 		v = append(v, x)
 		c = append(c, spCol)
 	}
-	if aux, ok := conv.SyntheticPKeys[spTable]; ok {
-		c = append(c, aux.Col)
+	if aux, ok := conv.SyntheticPKeys[tableId]; ok {
+		c = append(c, conv.SpSchema[tableId].ColDefs[aux.ColId].Name)
 		v = append(v, fmt.Sprintf("%d", int64(bits.Reverse64(uint64(aux.Sequence)))))
 		aux.Sequence++
-		conv.SyntheticPKeys[spTable] = aux
+		conv.SyntheticPKeys[tableId] = aux
 	}
-	return spTable, c, v, nil
+	colId := conv.SpSchema[tableId].ShardIdColumn
+	if colId != "" {
+		c = append(c, conv.SpSchema[tableId].ColDefs[colId].Name)
+		v = append(v, additionalAttributes.ShardId)
+	}
+	return conv.SpSchema[tableId].Name, c, v, nil
 }
 
 // convScalar converts a source database string value to an
@@ -103,11 +115,13 @@ func convScalar(conv *internal.Conv, spannerType ddl.Type, srcTypeName string, T
 	// We do not expect mysqldump to generate such output.
 	switch spannerType.Name {
 	case ddl.Bool:
-		return convBool(conv, val)
+		return convBool(conv, spannerType, srcTypeName, val)
 	case ddl.Bytes:
 		return convBytes(val)
 	case ddl.Date:
 		return convDate(val)
+	case ddl.Float32:
+		return convFloat32(val)
 	case ddl.Float64:
 		return convFloat64(val)
 	case ddl.Int64:
@@ -118,16 +132,29 @@ func convScalar(conv *internal.Conv, spannerType ddl.Type, srcTypeName string, T
 		return val, nil
 	case ddl.Timestamp:
 		return convTimestamp(srcTypeName, TimezoneOffset, val)
-	case ddl.JSON, ddl.JSONB:
+	case ddl.JSON:
 		return val, nil
 	default:
 		return val, fmt.Errorf("data conversion not implemented for type %v", spannerType.Name)
 	}
 }
 
-func convBool(conv *internal.Conv, val string) (bool, error) {
+func convBool(conv *internal.Conv, spannerType ddl.Type, srcTypeName string, val string) (bool, error) {
 	b, err := strconv.ParseBool(val)
 	if err != nil {
+
+		if srcTypeName == "bit" {
+			// To handle scenarios where bit is used to store boolean
+			// zero treated as false
+			// one treated as true
+			switch val {
+			case "\x00":
+				return false, nil
+			case "\x01":
+				return true, nil
+			}
+		}
+
 		// MySQL uses TINYINT(1) to implement BOOL/BOOLEAN, and does not
 		// enforce/validate boolean values i.e. any value that can be stored
 		// in a TINYINT (-128 to 127) can be stored in BOOL/BOOLEAN.
@@ -159,6 +186,14 @@ func convDate(val string) (civil.Date, error) {
 	return d, err
 }
 
+func convFloat32(val string) (float32, error) {
+	f, err := strconv.ParseFloat(val, 32)
+	if err != nil {
+		return float32(f), fmt.Errorf("can't convert to float32: %w", err)
+	}
+	return float32(f), err
+}
+
 func convFloat64(val string) (float64, error) {
 	f, err := strconv.ParseFloat(val, 64)
 	if err != nil {
@@ -178,7 +213,7 @@ func convInt64(val string) (int64, error) {
 // convNumeric maps a source database string value (representing a numeric)
 // into a string representing a valid Spanner numeric.
 func convNumeric(conv *internal.Conv, val string) (interface{}, error) {
-	if conv.TargetDb == constants.TargetExperimentalPostgres {
+	if conv.SpDialect == constants.DIALECT_POSTGRESQL {
 		return spanner.PGNumeric{Numeric: val, Valid: true}, nil
 	} else {
 		r := new(big.Rat)

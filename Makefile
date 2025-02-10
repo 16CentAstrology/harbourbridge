@@ -5,11 +5,12 @@ ifndef $(GOPATH)
 endif
 # Build the default binary
 build:
-	go build
+	cd ui/ && npm install && ng build
+	go build -o spanner-migration-tool
 # Build a static binary
 build-static:
-	go build -a -tags osusergo,netgo -ldflags '-w -extldflags "-static"' -o harbourbridge main.go
-# Create a new release for Harbourbridge.
+	go build -a -tags osusergo,netgo -ldflags '-w -extldflags "-static"' -o spanner-migration-tool main.go
+# Create a new release for Spanner migration tool.
 release:
 	./release.sh ${VERSION}
 # Update vendor dependencies
@@ -24,7 +25,9 @@ update-vendor:
 # Run unit tests
 test:
 	go test -v ./...
+	cd ui/ && npm test -- --browsers=ChromeHeadless --watch=false
 # Run code coverage with unit tests
 test-coverage:
 	go test ./... -coverprofile coverage.out -covermode count
 	go tool cover -func coverage.out
+	cd ui/ && npm test -- --browsers=ChromeHeadless --watch=false

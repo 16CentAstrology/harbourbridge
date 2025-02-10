@@ -16,6 +16,10 @@ app-object-detail {
   height: calc(100vh - 222px);
 }
 
+.artifactsButtons {
+  white-space: nowrap;
+}
+
 .container {
   padding: 7px 20px;
   margin-bottom: 20px;
@@ -86,26 +90,41 @@ app-object-detail {
   cursor: pointer;
 }
 
-::ng-deep .column-right .mat-tab-label .mat-tab-label-content {
+::ng-deep .column-right .mat-mdc-tab-label .mat-mdc-tab-label-content {
   font-size: 0.8rem;
 }
 
-::ng-deep .column-right .mat-tab-label {
+::ng-deep .column-right .mat-mdc-tab-label {
   min-width: 25px !important;
   padding: 10px;
 }
 
-::ng-deep .column-right .mat-tab-label.mat-tab-label-active {
+::ng-deep .column-right .mat-mdc-tab-label.mat-mdc-tab-label-active {
   min-width: 25px !important;
   padding: 7px;
 }
 
-::ng-deep .column-right .mat-tab-label-container {
+::ng-deep .column-right .mat-mdc-tab-label-container {
   margin-right: 40px;
 }
-::ng-deep .column-right .mat-tab-header-pagination-controls-enabled .mat-tab-label-container {
+::ng-deep .column-right .mat-mdc-tab-header-pagination-controls-enabled .mat-mdc-tab-label-container {
   margin-right: 0;
 }
-::ng-deep .column-right .mat-tab-header-pagination-after {
+::ng-deep .column-right .mat-mdc-tab-header-pagination-after {
   margin-right: 40px;
+}
+.split-button-left{
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  box-shadow: none;
+  padding-right: 1px;
+}
+.split-button-right{
+  box-shadow: none;
+  width: 30px !important;
+  min-width: unset !important;
+  padding: 0 2px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-right: 7px;
 }

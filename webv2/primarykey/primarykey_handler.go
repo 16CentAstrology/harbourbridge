@@ -21,33 +21,26 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/index"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
-
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/index"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/table"
 	"github.com/google/uuid"
 )
 
 // PrimaryKeyRequest represents  Primary keys API Payload.
 type PrimaryKeyRequest struct {
-	TableId string   `json:"TableId"`
-	Columns []Column `json:"Columns"`
+	TableId string         `json:"TableId"`
+	Columns []ddl.IndexKey `json:"Columns"`
 }
 
 // PrimaryKeyResponse represents  Primary keys API response.
 // Synth is true is for table Primary Key Id is not present and it is generated.
 type PrimaryKeyResponse struct {
-	TableId string   `json:"TableId"`
-	Columns []Column `json:"Columns"`
-	Synth   bool     `json:"Synth"`
-}
-
-// Column represents  SpannerTables Column.
-type Column struct {
-	ColumnId string `json:"ColumnId"`
-	ColName  string `json:"ColName"`
-	Desc     bool   `json:"Desc"`
-	Order    int    `json:"Order"`
+	TableId string         `json:"TableId"`
+	Columns []ddl.IndexKey `json:"Columns"`
+	Synth   bool           `json:"Synth"`
 }
 
 // primaryKey updates Primary keys in Spanner Table.
@@ -75,6 +68,8 @@ func PrimaryKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionState := session.GetSessionState()
+	sessionState.Conv.ConvLock.Lock()
+	defer sessionState.Conv.ConvLock.Unlock()
 	spannerTable, found := getSpannerTable(sessionState, pkRequest)
 
 	if !found {
@@ -105,19 +100,7 @@ func PrimaryKey(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	spannerTable = updatePrimaryKey(pkRequest, spannerTable)
-
-	//update spannerTable into sessionState.Conv.SpSchema.
-	for _, table := range sessionState.Conv.SpSchema {
-		if pkRequest.TableId == table.Id {
-			sessionState.Conv.SpSchema[table.Name] = spannerTable
-			for _, ind := range spannerTable.Indexes {
-				index.RemoveIndexIssues(spannerTable.Name, ind)
-			}
-		}
-	}
-
-	RemoveInterleave(sessionState.Conv, spannerTable)
+	UpdatePrimaryKey(pkRequest)
 	session.UpdateSessionFile()
 
 	convm := session.ConvWithMetadata{
@@ -131,33 +114,42 @@ func PrimaryKey(w http.ResponseWriter, r *http.Request) {
 	log.Println("request completed", "traceid", id.String(), "method", r.Method, "path", r.URL.Path, "remoteaddr", r.RemoteAddr)
 }
 
-// PrimaryKeyResponse represents primary key API response.
-// Synth is true for tables in which primary key is not present and is generated.
-func prepareResponse(pkRequest PrimaryKeyRequest, spannerTable ddl.CreateTable) PrimaryKeyResponse {
+func UpdatePrimaryKey(pkRequest PrimaryKeyRequest) {
 
-	var pKeyResponse PrimaryKeyResponse
+	sessionState := session.GetSessionState()
+	spannerTable, _ := getSpannerTable(sessionState, pkRequest)
+	tableId := spannerTable.Id
+	synthColId := ""
+	if synthCol, found := sessionState.Conv.SyntheticPKeys[tableId]; found {
+		synthColId = synthCol.ColId
+	}
 
-	pKeyResponse.TableId = pkRequest.TableId
+	spannerTable, isSynthPkRemoved := updatePrimaryKey(pkRequest, spannerTable, synthColId)
 
-	var isSynthPrimaryKey bool
+	if isSynthPkRemoved {
+		synthPks := sessionState.Conv.SyntheticPKeys
+		delete(synthPks, tableId)
+		sessionState.Conv.SyntheticPKeys = synthPks
+		table.RemoveColumn(tableId, synthColId, sessionState.Conv)
+		colIds := []string{}
+		for _, colId := range spannerTable.ColIds {
+			if colId != synthColId {
+				colIds = append(colIds, colId)
+			}
+		}
+		spannerTable.ColIds = colIds
+	}
 
-	for i := 0; i < len(spannerTable.ColNames); i++ {
-		if spannerTable.ColNames[i] == "synth_id" {
-			isSynthPrimaryKey = true
+	//update spannerTable into sessionState.Conv.SpSchema.
+	for _, table := range sessionState.Conv.SpSchema {
+		if pkRequest.TableId == table.Id {
+			sessionState.Conv.SpSchema[table.Id] = spannerTable
+			for _, ind := range spannerTable.Indexes {
+				index.RemoveIndexIssues(spannerTable.Id, ind)
+			}
 		}
 	}
+	common.ComputeNonKeyColumnSize(sessionState.Conv, pkRequest.TableId)
+	RemoveInterleave(sessionState.Conv, spannerTable)
 
-	pKeyResponse.Synth = isSynthPrimaryKey
-
-	for _, indexkey := range spannerTable.Pks {
-
-		responseColumn := Column{}
-		id := getColumnId(spannerTable, indexkey.Col)
-		responseColumn.ColumnId = id
-		responseColumn.ColName = indexkey.Col
-		responseColumn.Desc = indexkey.Desc
-		responseColumn.Order = indexkey.Order
-		pKeyResponse.Columns = append(pKeyResponse.Columns, responseColumn)
-	}
-	return pKeyResponse
 }

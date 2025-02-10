@@ -1,11 +1,11 @@
 import { Injectable } from '@angular/core'
 import { FetchService } from '../fetch/fetch.service'
-import IConv, { ICreateIndex, IForeignKey, IInterleaveStatus, IPrimaryKey } from '../../model/conv'
-import IRuleContent, { IRule } from 'src/app/model/rule'
-import { BehaviorSubject, forkJoin, Observable, of } from 'rxjs'
+import IConv, { ICheckConstraints, ICreateIndex, IForeignKey, IInterleaveStatus, IPrimaryKey } from '../../model/conv'
+import IRule from 'src/app/model/rule'
+import { BehaviorSubject, forkJoin, Observable, of, Subject } from 'rxjs'
 import { catchError, filter, map, tap } from 'rxjs/operators'
-import IUpdateTable from 'src/app/model/update-table'
-import IDumpConfig from 'src/app/model/dump-config'
+import IUpdateTable, { IAddColumn, IReviewInterleaveTableChanges, ITableColumnChanges } from 'src/app/model/update-table'
+import IDumpConfig, { IConvertFromDumpRequest } from 'src/app/model/dump-config'
 import ISessionConfig from '../../model/session-config'
 import ISession from 'src/app/model/session'
 import ISpannerConfig from '../../model/spanner-config'
@@ -13,6 +13,10 @@ import { SnackbarService } from '../snackbar/snackbar.service'
 import ISummary from 'src/app/model/summary'
 import { ClickEventService } from '../click-event/click-event.service'
 import { TableUpdatePubSubService } from '../table-update-pub-sub/table-update-pub-sub.service'
+import { ConversionService } from '../conversion/conversion.service'
+import { ColLength, Dialect } from 'src/app/app.constants'
+import { ITables } from 'src/app/model/migrate'
+import ICreateSequence from 'src/app/model/auto-gen'
 
 @Injectable({
   providedIn: 'root',
@@ -21,15 +25,20 @@ export class DataService {
   private convSubject = new BehaviorSubject<IConv>({} as IConv)
   private conversionRateSub = new BehaviorSubject({})
   private typeMapSub = new BehaviorSubject({})
+  private defaultTypeMapSub = new BehaviorSubject({})
+  private autoGenMapSub = new BehaviorSubject({})
   private summarySub = new BehaviorSubject(new Map<string, ISummary>())
   private ddlSub = new BehaviorSubject({})
+  private seqDdlSub = new BehaviorSubject({})
   private tableInterleaveStatusSub = new BehaviorSubject({} as IInterleaveStatus)
   private sessionsSub = new BehaviorSubject({} as ISession[])
   private configSub = new BehaviorSubject({} as ISpannerConfig)
   // currentSessionSub not using any where
   private currentSessionSub = new BehaviorSubject({} as ISession)
   private isOfflineSub = new BehaviorSubject<boolean>(false)
+  private isConfigSetSub = new BehaviorSubject<boolean>(false)
   private ruleMapSub = new BehaviorSubject<IRule[]>([])
+  private treeUpdatedSub = new Subject<void>();
 
   rule = this.ruleMapSub.asObservable()
   conv = this.convSubject.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
@@ -37,21 +46,26 @@ export class DataService {
     .asObservable()
     .pipe(filter((res) => Object.keys(res).length !== 0))
   typeMap = this.typeMapSub.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
-  summary = this.summarySub.asObservable().pipe(filter((res) => res.size >= 0))
+  defaultTypeMap = this.defaultTypeMapSub.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
+  autoGenMap = this.autoGenMapSub.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
+  treeUpdate = this.treeUpdatedSub.asObservable();
+  summary = this.summarySub.asObservable()
   ddl = this.ddlSub.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
+  seqDdl = this.seqDdlSub.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
   tableInterleaveStatus = this.tableInterleaveStatusSub.asObservable()
   sessions = this.sessionsSub.asObservable()
   config = this.configSub.asObservable().pipe(filter((res) => Object.keys(res).length !== 0))
   isOffline = this.isOfflineSub.asObservable()
+  isConfigSet = this.isConfigSetSub.asObservable()
   currentSession = this.currentSessionSub
     .asObservable()
     .pipe(filter((res) => Object.keys(res).length !== 0))
-
   constructor(
     private fetch: FetchService,
     private snackbar: SnackbarService,
     private clickEvent: ClickEventService,
-    private tableUpdatePubSub: TableUpdatePubSubService
+    private tableUpdatePubSub: TableUpdatePubSubService,
+    private conversion: ConversionService
   ) {
     this.getLastSessionDetails()
     this.getConfig()
@@ -62,6 +76,8 @@ export class DataService {
     this.convSubject.next({} as IConv)
     this.conversionRateSub.next({})
     this.typeMapSub.next({})
+    this.defaultTypeMapSub.next({})
+    this.autoGenMapSub.next({})
     this.summarySub.next(new Map<string, ISummary>())
     this.ddlSub.next({})
     this.tableInterleaveStatusSub.next({} as IInterleaveStatus)
@@ -73,9 +89,32 @@ export class DataService {
     })
   }
 
+  getSequenceDdl() {
+    this.fetch.getSequenceDdl().subscribe((res) => {
+      this.seqDdlSub.next(res)
+    })
+  }
+
+  getAutoGenMap() {
+    this.fetch.getAutoGenMap().subscribe((res) => {
+      this.autoGenMapSub.next(res)
+    })
+  }
+
+  notifyTreeUpdate() {
+    this.treeUpdatedSub.next();
+  }
+
   getSchemaConversionFromDb() {
-    this.fetch.getSchemaConversionFromDirectConnect().subscribe((res: IConv) => {
-      this.convSubject.next(res)
+    this.fetch.getSchemaConversionFromDirectConnect().subscribe({
+      next: (res: IConv) => {
+        this.convSubject.next(res)
+        this.ruleMapSub.next(res?.Rules)
+      },
+      error: (err: any) => {
+        this.clickEvent.closeDatabaseLoader()
+        this.snackbar.openSnackBar(err.error, 'Close')
+      },
     })
   }
 
@@ -103,8 +142,8 @@ export class DataService {
     })
   }
 
-  getSchemaConversionFromDump(payload: IDumpConfig) {
-    this.fetch.getSchemaConversionFromDump(payload).subscribe({
+  getSchemaConversionFromDump(payload: IConvertFromDumpRequest) {
+    return this.fetch.getSchemaConversionFromDump(payload).subscribe({
       next: (res: IConv) => {
         this.convSubject.next(res)
         this.ruleMapSub.next(res?.Rules)
@@ -117,7 +156,7 @@ export class DataService {
   }
 
   getSchemaConversionFromSession(payload: ISessionConfig) {
-    this.fetch.getSchemaConversionFromSessionFile(payload).subscribe({
+    return this.fetch.getSchemaConversionFromSessionFile(payload).subscribe({
       next: (res: IConv) => {
         this.convSubject.next(res)
         this.ruleMapSub.next(res?.Rules)
@@ -151,19 +190,25 @@ export class DataService {
     return forkJoin({
       rates: this.fetch.getConversionRate(),
       typeMap: this.fetch.getTypeMap(),
+      defaultTypeMap: this.fetch.getSpannerDefaultTypeMap(),
       summary: this.fetch.getSummary(),
       ddl: this.fetch.getDdl(),
+      seqDdl: this.fetch.getSequenceDdl(),
+      autoGenMap: this.fetch.getAutoGenMap()
     })
       .pipe(
         catchError((err: any) => {
           return of(err)
         })
       )
-      .subscribe(({ rates, typeMap, summary, ddl }: any) => {
+      .subscribe(({ rates, typeMap,defaultTypeMap, summary, ddl ,seqDdl, autoGenMap}: any) => {
         this.conversionRateSub.next(rates)
         this.typeMapSub.next(typeMap)
+        this.defaultTypeMapSub.next(defaultTypeMap)
         this.summarySub.next(new Map<string, ISummary>(Object.entries(summary)))
         this.ddlSub.next(ddl)
+        this.seqDdlSub.next(seqDdl)
+        this.autoGenMapSub.next(autoGenMap)
       })
   }
   getSummary() {
@@ -174,8 +219,8 @@ export class DataService {
     })
   }
 
-  reviewTableUpdate(tableName: string, data: IUpdateTable): Observable<string> {
-    return this.fetch.reviewTableUpdate(tableName, data).pipe(
+  reviewTableUpdate(tableId: string, data: IUpdateTable): Observable<string> {
+    return this.fetch.reviewTableUpdate(tableId, data).pipe(
       catchError((e: any) => {
         return of({ error: e.error })
       }),
@@ -184,6 +229,29 @@ export class DataService {
         if (data.error) {
           return data.error
         } else {
+          let standardDatatypeToPGSQLTypemap: Map<String, String>;
+          this.conversion.standardTypeToPGSQLTypeMap.subscribe((typemap) => {
+            standardDatatypeToPGSQLTypemap = typemap
+          })
+          this.conv.subscribe((convData: IConv) => {
+
+            data.Changes.forEach((table: IReviewInterleaveTableChanges) => {
+              table.InterleaveColumnChanges.forEach((column: ITableColumnChanges) => {
+                if (convData.SpDialect === Dialect.PostgreSQLDialect) {
+                  let pgSQLType = standardDatatypeToPGSQLTypemap.get(column.Type)
+                  let pgSQLUpdateType = standardDatatypeToPGSQLTypemap.get(column.UpdateType)
+                  column.Type = pgSQLType === undefined ? column.Type : pgSQLType
+                  column.UpdateType = pgSQLUpdateType === undefined ? column.UpdateType : pgSQLUpdateType
+                }
+                if (ColLength.DataTypes.indexOf(column.Type.toString())>-1) {
+                  column.Type += this.updateColumnSize(column.Size)
+                }
+                if (ColLength.DataTypes.indexOf(column.UpdateType.toString())>-1) {
+                  column.UpdateType += this.updateColumnSize(column.UpdateSize)
+                }
+              })
+            })
+          })
           this.tableUpdatePubSub.setTableReviewChanges(data)
           return ''
         }
@@ -191,8 +259,16 @@ export class DataService {
     )
   }
 
-  updateTable(tableName: string, data: IUpdateTable): Observable<string> {
-    return this.fetch.updateTable(tableName, data).pipe(
+  updateColumnSize(size: Number): string {
+    if (size === ColLength.StorageMaxLength) {
+      return '(MAX)'
+    } else {
+      return '(' + size + ')'
+    }
+  }
+
+  updateTable(tableId: string, data: IUpdateTable): Observable<string> {
+    return this.fetch.updateTable(tableId, data).pipe(
       catchError((e: any) => {
         return of({ error: e.error })
       }),
@@ -222,6 +298,25 @@ export class DataService {
           return data.error
         } else {
           this.convSubject.next(data)
+          return ''
+        }
+      })
+    )
+  }
+
+  restoreTables(tables: ITables): Observable<string> {
+    return this.fetch.restoreTables(tables).pipe(
+      catchError((e: any) => {
+        return of({ error: e.error })
+      }),
+      tap(console.log),
+      map((data) => {
+        if (data.error) {
+          this.snackbar.openSnackBar(data.error, 'Close')
+          return data.error
+        } else {
+          this.convSubject.next(data)
+          this.snackbar.openSnackBar('Selected tables restored successfully', 'Close', 5)
           return ''
         }
       })
@@ -259,7 +354,26 @@ export class DataService {
           return data.error
         } else {
           this.convSubject.next(data)
-          this.snackbar.openSnackBar('Table dropped successfully', 'Close', 5)
+          this.snackbar.openSnackBar('Table skipped successfully', 'Close', 5)
+          return ''
+        }
+      })
+    )
+  }
+
+  dropTables(tables: ITables): Observable<string> {
+    return this.fetch.dropTables(tables).pipe(
+      catchError((e: any) => {
+        return of({ error: e.error })
+      }),
+      tap(console.log),
+      map((data) => {
+        if (data.error) {
+          this.snackbar.openSnackBar(data.error, 'Close')
+          return data.error
+        } else {
+          this.convSubject.next(data)
+          this.snackbar.openSnackBar('Selected tables skipped successfully', 'Close', 5)
           return ''
         }
       })
@@ -284,6 +398,44 @@ export class DataService {
     )
   }
 
+  updateCheckConstraint(tableId: string, updatedCC: ICheckConstraints[]): Observable<string> {
+    return this.fetch.updateCheckConstraint(tableId, updatedCC).pipe(
+      catchError((e: any) => {
+        return of({ error: e.error })
+      }),
+      tap(response => console.log('Update Response:', response)),
+      map((response: any) => {
+        if (response.error) {
+          this.snackbar.openSnackBar(response.error, 'Close')
+          return response.error;
+        } else {
+          this.convSubject.next(response);
+          this.getDdl();
+          return '';
+        }
+      })
+    );
+  }
+
+  verifyCheckConstraintExpression(): Observable<boolean> {
+    return this.fetch.verifyCheckConstraintExpression().pipe(
+      catchError((e: any) => {
+        return of({ error: e.error })
+      }),
+      tap(response => console.log('Update Response:', response)),
+      map((response: any) => {
+        if (response.error) {
+          this.snackbar.openSnackBar(response.error, 'Close')
+          return response.error
+        } else {
+          this.convSubject.next(response.sessionState);
+          this.getDdl();
+          return response.hasErrorOccurred;
+        }
+      })
+    );
+  }
+
   updateFkNames(tableId: string, updatedFk: IForeignKey[]): Observable<string> {
     return this.fetch.updateFk(tableId, updatedFk).pipe(
       catchError((e: any) => {
@@ -302,8 +454,8 @@ export class DataService {
     )
   }
 
-  dropFk(tableName: string, fkName: string) {
-    return this.fetch.removeFk(tableName, fkName).pipe(
+  dropFk(tableId: string, fkId: string) {
+    return this.fetch.removeFk(tableId, fkId).pipe(
       catchError((e: any) => {
         return of({ error: e.error })
       }),
@@ -330,15 +482,43 @@ export class DataService {
     this.configSub.next(config)
   }
 
-  initiateSession() {
-    this.fetch.InitiateSession().subscribe((data: any) => {
-      this.currentSessionSub.next(data)
-    })
-  }
-
   updateIsOffline() {
     this.fetch.getIsOffline().subscribe((res: boolean) => {
       this.isOfflineSub.next(res)
+    })
+  }
+
+  updateIsConfigSet() {
+    this.fetch.getIsConfigSet().subscribe((res: boolean) => {
+      this.isConfigSetSub.next(res)
+    })
+  }
+
+  addColumn(tableId: string,payload: IAddColumn) {
+    this.fetch.addColumn(tableId,payload).subscribe({
+      next: (res: any) => {
+        this.convSubject.next(res)
+        this.getDdl()
+        this.snackbar.openSnackBar('Added new column.', 'Close', 5)
+      },
+      error: (err: any) => {
+        this.snackbar.openSnackBar(err.error, 'Close')
+      },
+    })
+  }
+
+  addSequence(payload: ICreateSequence) {
+    this.fetch.addSequence(payload).subscribe({
+      next: (res: any) => {
+        this.convSubject.next(res)
+        this.getSequenceDdl()
+        this.getAutoGenMap()
+        this.notifyTreeUpdate();
+        this.snackbar.openSnackBar('Added new sequence.', 'Close', 5)
+      },
+      error: (err: any) => {
+        this.snackbar.openSnackBar(err.error, 'Close')
+      },
     })
   }
 
@@ -347,6 +527,7 @@ export class DataService {
       next: (res: any) => {
         this.convSubject.next(res)
         this.ruleMapSub.next(res?.Rules)
+        this.getDdl()
         this.snackbar.openSnackBar('Added new rule.', 'Close', 5)
       },
       error: (err: any) => {
@@ -354,9 +535,8 @@ export class DataService {
       },
     })
   }
-
-  updateIndex(tableName: string, payload: ICreateIndex[]) {
-    return this.fetch.updateIndex(tableName, payload).pipe(
+  updateIndex(tableId: string, payload: ICreateIndex[]) {
+    return this.fetch.updateIndex(tableId, payload).pipe(
       catchError((e: any) => {
         return of({ error: e.error })
       }),
@@ -373,8 +553,27 @@ export class DataService {
     )
   }
 
-  dropIndex(tableName: string, indexName: string): Observable<string> {
-    return this.fetch.dropIndex(tableName, indexName).pipe(
+  updateSequence(payload: ICreateSequence) {
+    return this.fetch.updateSequence(payload).pipe(
+      catchError((e: any) => {
+        return of({ error: e.error })
+      }),
+      tap(console.log),
+      map((data: any) => {
+        if (data.error) {
+          return data.error
+        } else {
+          this.convSubject.next(data)
+          this.getSequenceDdl()
+          this.notifyTreeUpdate();
+          return ''
+        }
+      })
+    )
+  }
+
+  dropIndex(tableId: string, indexId: string): Observable<string> {
+    return this.fetch.dropIndex(tableId, indexId).pipe(
       catchError((e: any) => {
         return of({ error: e.error })
       }),
@@ -387,7 +586,29 @@ export class DataService {
           this.convSubject.next(data)
           this.getDdl()
           this.ruleMapSub.next(data?.Rules)
-          this.snackbar.openSnackBar('Index dropped successfully', 'Close', 5)
+          this.snackbar.openSnackBar('Index skipped successfully', 'Close', 5)
+          return ''
+        }
+      })
+    )
+  }
+
+  dropSequence(sequenceId: string): Observable<string> {
+    return this.fetch.dropSequence(sequenceId).pipe(
+      catchError((e: any) => {
+        return of({ error: e.error })
+      }),
+      tap(console.log),
+      map((data) => {
+        if (data.error) {
+          this.snackbar.openSnackBar(data.error, 'Close')
+          return data.error
+        } else {
+          this.convSubject.next(data)
+          this.getDdl()
+          this.getAutoGenMap()
+          this.notifyTreeUpdate();
+          this.snackbar.openSnackBar('Sequence Deleted successfully', 'Close', 5)
           return ''
         }
       })
@@ -413,14 +634,15 @@ export class DataService {
     )
   }
 
-  getInterleaveConversionForATable(tableName: string) {
-    this.fetch.getInterleaveStatus(tableName).subscribe((res: IInterleaveStatus) => {
+  getInterleaveConversionForATable(tableId: string) {
+    this.fetch.getInterleaveStatus(tableId).subscribe((res: IInterleaveStatus) => {
       this.tableInterleaveStatusSub.next(res)
     })
   }
 
-  setInterleave(tableName: string) {
-    this.fetch.setInterleave(tableName).subscribe((res: any) => {
+  setInterleave(tableId: string) {
+    this.fetch.setInterleave(tableId).subscribe((res: any) => {
+      this.convSubject.next(res.sessionState)
       this.getDdl()
       if (res.sessionState) {
         this.convSubject.next(res.sessionState as IConv)
@@ -451,6 +673,7 @@ export class DataService {
       next: (res: any) => {
         this.convSubject.next(res)
         this.ruleMapSub.next(res?.Rules)
+        this.getDdl()
         this.snackbar.openSnackBar('Rule deleted successfully', 'Close', 5)
       },
       error: (err: any) => {

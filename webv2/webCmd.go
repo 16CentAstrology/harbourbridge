@@ -23,18 +23,20 @@ import (
 	"path"
 	"path/filepath"
 
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/logger"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
 	"github.com/google/subcommands"
-	"go.uber.org/zap"
 )
 
 var FrontendDir embed.FS
 
 type WebCmd struct {
-	DistDir  embed.FS
-	logLevel string
-	open     bool
+	DistDir          embed.FS
+	logLevel         string
+	open             bool
+	port             int
+	validate         bool
+	dataflowTemplate string
 }
 
 // Name returns the name of operation.
@@ -44,7 +46,7 @@ func (cmd *WebCmd) Name() string {
 
 // Synopsis returns summary of operation.
 func (cmd *WebCmd) Synopsis() string {
-	return "run the web UI for HarbourBridge"
+	return "run the web UI for Spanner migration tool"
 }
 
 func (cmd *WebCmd) Usage() string {
@@ -52,20 +54,26 @@ func (cmd *WebCmd) Usage() string {
 }
 
 func (cmd *WebCmd) SetFlags(f *flag.FlagSet) {
-	f.StringVar(&cmd.logLevel, "log-level", "INFO", "Configure the logging level for the command (INFO, DEBUG), defaults to INFO")
-	f.BoolVar(&cmd.open, "open", true, "Opens the Harbourbridge web interface in the default browser, defaults to true")
+	f.StringVar(&cmd.logLevel, "log-level", "DEBUG", "Configure the logging level for the command (INFO, DEBUG), defaults to DEBUG")
+	f.BoolVar(&cmd.open, "open", false, "Opens the Spanner migration tool web interface in the default browser, defaults to false")
+	f.IntVar(&cmd.port, "port", 8080, "The port in which Spanner migration tool will run, defaults to 8080")
+	f.BoolVar(&cmd.validate, "validate", false, "Flag for validating if all the required input parameters are present")
+	f.StringVar(&cmd.dataflowTemplate, "dataflow-template", constants.DEFAULT_TEMPLATE_PATH, "GCS path of the Dataflow template")
 }
 
 func (cmd *WebCmd) Execute(ctx context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
-	os.RemoveAll(filepath.Join(os.TempDir(), constants.HB_TMP_DIR))
+	os.RemoveAll(filepath.Join(os.TempDir(), constants.SMT_TMP_DIR))
+	utils.SetDataflowTemplatePath(cmd.dataflowTemplate)
 	FrontendDir = cmd.DistDir
+	if cmd.validate {
+		return subcommands.ExitSuccess
+	}
 	var err error
 	defer func() {
 		if err != nil {
-			logger.Log.Fatal("FATAL error", zap.Error(err))
+			fmt.Printf("FATAL error, unable to start webapp: %s", err)
 		}
 	}()
-	defer logger.Log.Sync()
-	App(cmd.logLevel, cmd.open)
+	err = App(cmd.logLevel, cmd.open, cmd.port)
 	return subcommands.ExitSuccess
 }

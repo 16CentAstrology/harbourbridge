@@ -18,6 +18,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -25,20 +26,24 @@ import (
 	_ "github.com/go-sql-driver/mysql" // The driver should be used via the database/sql package.
 	_ "github.com/lib/pq"
 
-	"github.com/cloudspannerecosystem/harbourbridge/internal"
-	"github.com/cloudspannerecosystem/harbourbridge/profiles"
-	"github.com/cloudspannerecosystem/harbourbridge/schema"
-	"github.com/cloudspannerecosystem/harbourbridge/sources/common"
-	"github.com/cloudspannerecosystem/harbourbridge/spanner/ddl"
-	"github.com/cloudspannerecosystem/harbourbridge/streaming"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/internal"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/profiles"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/schema"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/sources/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/spanner/ddl"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/streaming"
 )
+
+var collationRegex = regexp.MustCompile(constants.DB_COLLATION_REGEX)
 
 // InfoSchemaImpl is MySQL specific implementation for InfoSchema.
 type InfoSchemaImpl struct {
-	DbName        string
-	Db            *sql.DB
-	SourceProfile profiles.SourceProfile
-	TargetProfile profiles.TargetProfile
+	DbName             string
+	Db                 *sql.DB
+	MigrationProjectId string
+	SourceProfile      profiles.SourceProfile
+	TargetProfile      profiles.TargetProfile
 }
 
 // GetToDdl implement the common.InfoSchema interface.
@@ -52,18 +57,22 @@ func (isi InfoSchemaImpl) GetTableName(dbName string, tableName string) string {
 }
 
 // GetRowsFromTable returns a sql Rows object for a table.
-func (isi InfoSchemaImpl) GetRowsFromTable(conv *internal.Conv, srcTable string) (interface{}, error) {
-	srcSchema := conv.SrcSchema[srcTable]
-	srcCols := srcSchema.ColNames
+func (isi InfoSchemaImpl) GetRowsFromTable(conv *internal.Conv, tableId string) (interface{}, error) {
+	srcSchema := conv.SrcSchema[tableId]
+	srcCols := []string{}
+
+	for _, srcColId := range srcSchema.ColIds {
+		srcCols = append(srcCols, conv.SrcSchema[tableId].ColDefs[srcColId].Name)
+	}
 	if len(srcCols) == 0 {
-		conv.Unexpected(fmt.Sprintf("Couldn't get source columns for table %s ", srcTable))
+		conv.Unexpected(fmt.Sprintf("Couldn't get source columns for table %s ", srcSchema.Name))
 		return nil, nil
 	}
 	// MySQL schema and name can be arbitrary strings.
 	// Ideally we would pass schema/name as a query parameter,
 	// but MySQL doesn't support this. So we quote it instead.
 	colNameList := buildColNameList(srcSchema, srcCols)
-	q := fmt.Sprintf("SELECT %s FROM `%s`.`%s`;", colNameList, conv.SrcSchema[srcTable].Schema, srcTable)
+	q := fmt.Sprintf("SELECT %s FROM `%s`.`%s`;", colNameList, isi.DbName, srcSchema.Name)
 	rows, err := isi.Db.Query(q)
 	return rows, err
 }
@@ -89,27 +98,38 @@ func buildColNameList(srcSchema schema.Table, srcColName []string) string {
 }
 
 // ProcessData performs data conversion for source database.
-func (isi InfoSchemaImpl) ProcessData(conv *internal.Conv, srcTable string, srcSchema schema.Table, spTable string, spCols []string, spSchema ddl.CreateTable) error {
-	rowsInterface, err := isi.GetRowsFromTable(conv, srcTable)
+func (isi InfoSchemaImpl) ProcessData(conv *internal.Conv, tableId string, srcSchema schema.Table, commonColIds []string, spSchema ddl.CreateTable, additionalAttributes internal.AdditionalDataAttributes) error {
+	srcTableName := conv.SrcSchema[tableId].Name
+	rowsInterface, err := isi.GetRowsFromTable(conv, tableId)
 	if err != nil {
-		conv.Unexpected(fmt.Sprintf("Couldn't get data for table %s : err = %s", srcTable, err))
+		conv.Unexpected(fmt.Sprintf("Couldn't get data for table %s : err = %s", srcTableName, err))
 		return err
 	}
 	rows := rowsInterface.(*sql.Rows)
 	defer rows.Close()
 	srcCols, _ := rows.Columns()
 	v, scanArgs := buildVals(len(srcCols))
+	colNameIdMap := internal.GetSrcColNameIdMap(conv.SrcSchema[tableId])
 	for rows.Next() {
 		// get RawBytes from data.
 		err := rows.Scan(scanArgs...)
 		if err != nil {
 			conv.Unexpected(fmt.Sprintf("Couldn't process sql data row: %s", err))
 			// Scan failed, so we don't have any data to add to bad rows.
-			conv.StatsAddBadRow(srcTable, conv.DataMode())
+			conv.StatsAddBadRow(srcTableName, conv.DataMode())
 			continue
 		}
 		values := valsToStrings(v)
-		ProcessDataRow(conv, srcTable, srcCols, srcSchema, spTable, spCols, spSchema, values)
+
+		newValues, err := common.PrepareValues(conv, tableId, colNameIdMap, commonColIds, srcCols, values)
+		if err != nil {
+			conv.Unexpected(fmt.Sprintf("Error while converting data: %s\n", err))
+			conv.StatsAddBadRow(srcTableName, conv.DataMode())
+			conv.CollectBadRow(srcTableName, srcCols, values)
+			continue
+		}
+
+		ProcessDataRow(conv, tableId, commonColIds, srcSchema, spSchema, newValues, additionalAttributes)
 	}
 	return nil
 }
@@ -130,7 +150,7 @@ func (isi InfoSchemaImpl) GetRowCount(table common.SchemaAndName) (int64, error)
 		err := rows.Scan(&count)
 		return count, err
 	}
-	return 0, nil //Check if 0 is ok to return
+	return 0, nil // Check if 0 is ok to return
 }
 
 // GetTables return list of tables in the selected database.
@@ -163,11 +183,13 @@ func (isi InfoSchemaImpl) GetColumns(conv *internal.Conv, table common.SchemaAnd
 	if err != nil {
 		return nil, nil, fmt.Errorf("couldn't get schema for table %s.%s: %s", table.Schema, table.Name, err)
 	}
+	defer cols.Close()
 	colDefs := make(map[string]schema.Column)
-	var colNames []string
+	var colIds []string
 	var colName, dataType, isNullable, columnType string
 	var colDefault, colExtra sql.NullString
 	var charMaxLen, numericPrecision, numericScale sql.NullInt64
+	var colAutoGen ddl.AutoGenCol
 	for cols.Next() {
 		err := cols.Scan(&colName, &dataType, &columnType, &isNullable, &colDefault, &charMaxLen, &numericPrecision, &numericScale, &colExtra)
 		if err != nil {
@@ -175,86 +197,193 @@ func (isi InfoSchemaImpl) GetColumns(conv *internal.Conv, table common.SchemaAnd
 			continue
 		}
 		ignored := schema.Ignored{}
-		for _, c := range constraints[colName] {
-			// c can be UNIQUE, PRIMARY KEY, FOREIGN KEY or CHECK
-			// We've already filtered out PRIMARY KEY.
-			switch c {
-			case "CHECK":
-				ignored.Check = true
-			case "FOREIGN KEY", "PRIMARY KEY", "UNIQUE":
-				// Nothing to do here -- these are all handled elsewhere.
+		ignored.Default = colDefault.Valid
+		colId := internal.GenerateColumnId()
+		if colExtra.String == "auto_increment" {
+			sequence := createSequence(conv)
+			colAutoGen = ddl.AutoGenCol{
+				Name:           sequence.Name,
+				GenerationType: constants.AUTO_INCREMENT,
+			}
+			sequence.ColumnsUsingSeq = map[string][]string{
+				table.Id: {colId},
+			}
+			conv.SrcSequences[sequence.Id] = sequence
+		} else {
+			colAutoGen = ddl.AutoGenCol{}
+		}
+
+		defaultVal := ddl.DefaultValue{
+			IsPresent: colDefault.Valid,
+			Value:     ddl.Expression{},
+		}
+		if colDefault.Valid {
+			ty := dataType
+			if conv.SpDialect == constants.DIALECT_POSTGRESQL {
+				ty = ddl.GetPGType(ddl.Type{Name: ty})
+			}
+			defaultVal.Value = ddl.Expression{
+				ExpressionId: internal.GenerateExpressionId(),
+				Statement:    common.SanitizeDefaultValue(colDefault.String, ty, colExtra.String == constants.DEFAULT_GENERATED),
 			}
 		}
-		ignored.Default = colDefault.Valid
-		if colExtra.String == "auto_increment" {
-			ignored.AutoIncrement = true
-		}
+
 		c := schema.Column{
-			Name:    colName,
-			Type:    toType(dataType, columnType, charMaxLen, numericPrecision, numericScale),
-			NotNull: common.ToNotNull(conv, isNullable),
-			Ignored: ignored,
+			Id:           colId,
+			Name:         colName,
+			Type:         toType(dataType, columnType, charMaxLen, numericPrecision, numericScale),
+			NotNull:      common.ToNotNull(conv, isNullable),
+			Ignored:      ignored,
+			AutoGen:      colAutoGen,
+			DefaultValue: defaultVal,
 		}
-		colDefs[colName] = c
-		colNames = append(colNames, colName)
+		colDefs[colId] = c
+		colIds = append(colIds, colId)
 	}
-	return colDefs, colNames, nil
+	return colDefs, colIds, nil
 }
 
 // GetConstraints returns a list of primary keys and by-column map of
 // other constraints.  Note: we need to preserve ordinal order of
 // columns in primary key constraints.
 // Note that foreign key constraints are handled in getForeignKeys.
-func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.SchemaAndName) ([]string, map[string][]string, error) {
-	q := `SELECT k.COLUMN_NAME, t.CONSTRAINT_TYPE
-              FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t
-                INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
-                  ON t.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND t.TABLE_NAME=k.TABLE_NAME
-              WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? ORDER BY k.ordinal_position;`
-	rows, err := isi.Db.Query(q, table.Schema, table.Name)
+func (isi InfoSchemaImpl) GetConstraints(conv *internal.Conv, table common.SchemaAndName) ([]string, []schema.CheckConstraint, map[string][]string, error) {
+	finalQuery, err := isi.getConstraintsDQL()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	rows, err := isi.Db.Query(finalQuery, table.Schema, table.Name)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	defer rows.Close()
+
 	var primaryKeys []string
-	var col, constraint string
+	var checkKeys []schema.CheckConstraint
 	m := make(map[string][]string)
+
 	for rows.Next() {
-		err := rows.Scan(&col, &constraint)
-		if err != nil {
-			conv.Unexpected(fmt.Sprintf("Can't scan: %v", err))
+		if err := isi.processRow(rows, conv, &primaryKeys, &checkKeys, m); err != nil {
+			conv.Unexpected(fmt.Sprintf("Can't scan constrants. error: %v", err))
 			continue
-		}
-		if col == "" || constraint == "" {
-			conv.Unexpected(fmt.Sprintf("Got empty col or constraint"))
-			continue
-		}
-		switch constraint {
-		case "PRIMARY KEY":
-			primaryKeys = append(primaryKeys, col)
-		default:
-			m[col] = append(m[col], constraint)
 		}
 	}
-	return primaryKeys, m, nil
+
+	return primaryKeys, checkKeys, m, nil
+}
+
+// getConstraintsDQL returns the appropriate SQL query based on the existence of CHECK_CONSTRAINTS.
+func (isi InfoSchemaImpl) getConstraintsDQL() (string, error) {
+	var tableExistsCount int
+	// check if CHECK_CONSTRAINTS table exists.
+	checkQuery := `SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE (TABLE_SCHEMA = 'information_schema' OR TABLE_SCHEMA = 'INFORMATION_SCHEMA') AND TABLE_NAME = 'CHECK_CONSTRAINTS';`
+	err := isi.Db.QueryRow(checkQuery).Scan(&tableExistsCount)
+	if err != nil {
+		return "", err
+	}
+
+	// mysql version 8.0.16 and above has CHECK_CONSTRAINTS table.
+	if tableExistsCount > 0 {
+		return `SELECT DISTINCT COALESCE(k.COLUMN_NAME,'') AS COLUMN_NAME,t.CONSTRAINT_NAME, t.CONSTRAINT_TYPE, COALESCE(c.CHECK_CLAUSE, '') AS CHECK_CLAUSE
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t
+            LEFT JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
+            ON t.CONSTRAINT_NAME = k.CONSTRAINT_NAME 
+            AND t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA 
+            AND t.TABLE_NAME = k.TABLE_NAME
+            LEFT JOIN INFORMATION_SCHEMA.CHECK_CONSTRAINTS AS c
+            ON t.CONSTRAINT_NAME = c.CONSTRAINT_NAME
+	    AND t.TABLE_SCHEMA = c.CONSTRAINT_SCHEMA
+            WHERE t.TABLE_SCHEMA = ? 
+            AND t.TABLE_NAME = ?;`, nil
+	}
+	return `SELECT k.COLUMN_NAME, t.CONSTRAINT_TYPE
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t
+            INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
+            ON t.CONSTRAINT_NAME = k.CONSTRAINT_NAME 
+            AND t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA 
+            AND t.TABLE_NAME = k.TABLE_NAME
+            WHERE t.TABLE_SCHEMA = ?
+            AND t.TABLE_NAME = ?
+            ORDER BY k.ORDINAL_POSITION;`, nil
+}
+
+// processRow handles scanning and processing of a database row for GetConstraints.
+func (isi InfoSchemaImpl) processRow(
+	rows *sql.Rows, conv *internal.Conv, primaryKeys *[]string,
+	checkKeys *[]schema.CheckConstraint, m map[string][]string,
+) error {
+	var col, constraintType, checkClause, constraintName string
+	var err error
+	cols, err := rows.Columns()
+	if err != nil {
+		conv.Unexpected(fmt.Sprintf("Failed to get columns: %v", err))
+		return err
+	}
+
+	switch len(cols) {
+	case 2:
+		err = rows.Scan(&col, &constraintType)
+	case 4:
+		err = rows.Scan(&col, &constraintName, &constraintType, &checkClause)
+	default:
+		conv.Unexpected(fmt.Sprintf("unexpected number of columns: %d", len(cols)))
+		return fmt.Errorf("unexpected number of columns: %d", len(cols))
+	}
+	if err != nil {
+		return err
+	}
+
+	if col == "" && constraintType == "" {
+		conv.Unexpected("Got empty column or constraint type")
+		return nil
+	}
+
+	switch constraintType {
+	case "PRIMARY KEY":
+		*primaryKeys = append(*primaryKeys, col)
+
+	// Case added to handle check constraints
+	case "CHECK":
+		checkClause = collationRegex.ReplaceAllString(checkClause, "")
+		checkClause = checkAndAddParentheses(checkClause)
+		*checkKeys = append(*checkKeys, schema.CheckConstraint{Name: constraintName, Expr: checkClause, ExprId: internal.GenerateExpressionId(), Id: internal.GenerateCheckConstrainstId()})
+	default:
+		m[col] = append(m[col], constraintType)
+	}
+	return nil
+}
+
+// checkAndAddParentheses this method will check parentheses  if found it will return same string
+// or add the parentheses then return the string
+func checkAndAddParentheses(checkClause string) string {
+	if strings.HasPrefix(checkClause, "(") && strings.HasSuffix(checkClause, ")") {
+		return checkClause
+	} else {
+		return `(` + checkClause + `)`
+	}
 }
 
 // GetForeignKeys return list all the foreign keys constraints.
 // MySQL supports cross-database foreign key constraints. We ignore
-// them because HarbourBridge works database at a time (a specific run
-// of HarbourBridge focuses on a specific database) and so we can't handle
+// them because the Spanner migration tool works database at a time (a specific run
+// of the Spanner migration tool focuses on a specific database) and so we can't handle
 // them effectively.
 func (isi InfoSchemaImpl) GetForeignKeys(conv *internal.Conv, table common.SchemaAndName) (foreignKeys []schema.ForeignKey, err error) {
-	q := `SELECT k.REFERENCED_TABLE_NAME,k.COLUMN_NAME,k.REFERENCED_COLUMN_NAME,k.CONSTRAINT_NAME
-		FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS t 
-		INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k 
-			ON t.CONSTRAINT_NAME = k.CONSTRAINT_NAME 
-			AND t.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA 
-			AND t.TABLE_NAME = k.TABLE_NAME 
+	q := `SELECT k.REFERENCED_TABLE_NAME,
+			k.COLUMN_NAME,
+			k.REFERENCED_COLUMN_NAME,
+			k.CONSTRAINT_NAME,
+			r.DELETE_RULE,
+			r.UPDATE_RULE
+		FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS AS r
+		INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
+			ON r.CONSTRAINT_NAME = k.CONSTRAINT_NAME
+			AND r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA
+			AND r.TABLE_NAME = k.TABLE_NAME
+			AND r.REFERENCED_TABLE_NAME = k.REFERENCED_TABLE_NAME
 			AND k.REFERENCED_TABLE_SCHEMA = k.TABLE_SCHEMA
-		WHERE k.TABLE_SCHEMA = ? 
-			AND k.TABLE_NAME = ? 
-			AND t.CONSTRAINT_TYPE = "FOREIGN KEY" 
+		WHERE k.TABLE_SCHEMA = ?
+			AND k.TABLE_NAME = ?
 		ORDER BY
 			k.REFERENCED_TABLE_NAME,
 			k.COLUMN_NAME,
@@ -264,12 +393,12 @@ func (isi InfoSchemaImpl) GetForeignKeys(conv *internal.Conv, table common.Schem
 		return nil, err
 	}
 	defer rows.Close()
-	var col, refCol, refTable, fKeyName string
+	var col, refCol, refTable, fKeyName, OnDelete, OnUpdate string
 	fKeys := make(map[string]common.FkConstraint)
 	var keyNames []string
 
 	for rows.Next() {
-		err := rows.Scan(&refTable, &col, &refCol, &fKeyName)
+		err := rows.Scan(&refTable, &col, &refCol, &fKeyName, &OnDelete, &OnUpdate)
 		if err != nil {
 			conv.Unexpected(fmt.Sprintf("Can't scan: %v", err))
 			continue
@@ -279,25 +408,31 @@ func (isi InfoSchemaImpl) GetForeignKeys(conv *internal.Conv, table common.Schem
 			fk.Cols = append(fk.Cols, col)
 			fk.Refcols = append(fk.Refcols, refCol)
 			fKeys[fKeyName] = fk
+			fk.OnDelete = OnDelete
+			fk.OnUpdate = OnUpdate
 			continue
 		}
-		fKeys[fKeyName] = common.FkConstraint{Name: fKeyName, Table: refTable, Refcols: []string{refCol}, Cols: []string{col}}
+		fKeys[fKeyName] = common.FkConstraint{Name: fKeyName, Table: refTable, Refcols: []string{refCol}, Cols: []string{col}, OnDelete: OnDelete, OnUpdate: OnUpdate}
 		keyNames = append(keyNames, fKeyName)
 	}
 	sort.Strings(keyNames)
 	for _, k := range keyNames {
 		foreignKeys = append(foreignKeys,
 			schema.ForeignKey{
-				Name:         fKeys[k].Name,
-				Columns:      fKeys[k].Cols,
-				ReferTable:   fKeys[k].Table,
-				ReferColumns: fKeys[k].Refcols})
+				Id:               internal.GenerateForeignkeyId(),
+				Name:             fKeys[k].Name,
+				ColumnNames:      fKeys[k].Cols,
+				ReferTableName:   fKeys[k].Table,
+				ReferColumnNames: fKeys[k].Refcols,
+				OnDelete:         fKeys[k].OnDelete,
+				OnUpdate:         fKeys[k].OnUpdate,
+			})
 	}
 	return foreignKeys, nil
 }
 
 // GetIndexes return a list of all indexes for the specified table.
-func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAndName) ([]schema.Index, error) {
+func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAndName, colNameIdMap map[string]string) ([]schema.Index, error) {
 	q := `SELECT DISTINCT INDEX_NAME,COLUMN_NAME,SEQ_IN_INDEX,COLLATION,NON_UNIQUE
 		FROM INFORMATION_SCHEMA.STATISTICS 
 		WHERE TABLE_SCHEMA = ?
@@ -321,10 +456,17 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 		}
 		if _, found := indexMap[name]; !found {
 			indexNames = append(indexNames, name)
-			indexMap[name] = schema.Index{Name: name, Unique: (nonUnique == "0")}
+			indexMap[name] = schema.Index{
+				Id:     internal.GenerateIndexesId(),
+				Name:   name,
+				Unique: (nonUnique == "0"),
+			}
 		}
 		index := indexMap[name]
-		index.Keys = append(index.Keys, schema.Key{Column: column, Desc: (collation.Valid && collation.String == "D")})
+		index.Keys = append(index.Keys, schema.Key{
+			ColId: colNameIdMap[column],
+			Desc:  (collation.Valid && collation.String == "D"),
+		})
 		indexMap[name] = index
 	}
 	for _, k := range indexNames {
@@ -337,7 +479,27 @@ func (isi InfoSchemaImpl) GetIndexes(conv *internal.Conv, table common.SchemaAnd
 // performing a streaming migration.
 func (isi InfoSchemaImpl) StartChangeDataCapture(ctx context.Context, conv *internal.Conv) (map[string]interface{}, error) {
 	mp := make(map[string]interface{})
-	streamingCfg, err := streaming.StartDatastream(ctx, isi.SourceProfile, isi.TargetProfile)
+	var (
+		schemaDetails map[string]internal.SchemaDetails
+		err           error
+	)
+	commonInfoSchema := common.InfoSchemaImpl{}
+	schemaDetails, err = commonInfoSchema.GetIncludedSrcTablesFromConv(conv)
+	streamingCfg, err := streaming.ReadStreamingConfig(isi.SourceProfile.Conn.Mysql.StreamingConfig, isi.TargetProfile.Conn.Sp.Dbname, schemaDetails)
+	if err != nil {
+		return nil, fmt.Errorf("error reading streaming config: %v", err)
+	}
+	pubsubCfg, err := streaming.CreatePubsubResources(ctx, isi.MigrationProjectId, streamingCfg.DatastreamCfg.DestinationConnectionConfig, isi.SourceProfile.Conn.Mysql.Db, constants.REGULAR_GCS)
+	if err != nil {
+		return nil, fmt.Errorf("error creating pubsub resources: %v", err)
+	}
+	streamingCfg.PubsubCfg = *pubsubCfg
+	dlqPubsubCfg, err := streaming.CreatePubsubResources(ctx, isi.MigrationProjectId, streamingCfg.DatastreamCfg.DestinationConnectionConfig, isi.SourceProfile.Conn.Mysql.Db, constants.DLQ_GCS)
+	if err != nil {
+		return nil, fmt.Errorf("error creating pubsub resources: %v", err)
+	}
+	streamingCfg.DlqPubsubCfg = *dlqPubsubCfg
+	streamingCfg, err = streaming.StartDatastream(ctx, isi.MigrationProjectId, streamingCfg, isi.SourceProfile, isi.TargetProfile, schemaDetails)
 	if err != nil {
 		err = fmt.Errorf("error starting datastream: %v", err)
 		return nil, err
@@ -348,15 +510,15 @@ func (isi InfoSchemaImpl) StartChangeDataCapture(ctx context.Context, conv *inte
 
 // StartStreamingMigration is used for automatic triggering of Dataflow job when
 // performing a streaming migration.
-func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, client *sp.Client, conv *internal.Conv, streamingInfo map[string]interface{}) error {
+func (isi InfoSchemaImpl) StartStreamingMigration(ctx context.Context, migrationProjectId string, client *sp.Client, conv *internal.Conv, streamingInfo map[string]interface{}) (internal.DataflowOutput, error) {
 	streamingCfg, _ := streamingInfo["streamingCfg"].(streaming.StreamingCfg)
 
-	err := streaming.StartDataflow(ctx, isi.SourceProfile, isi.TargetProfile, streamingCfg, conv)
+	dfOutput, err := streaming.StartDataflow(ctx, migrationProjectId, isi.TargetProfile, streamingCfg, conv)
 	if err != nil {
 		err = fmt.Errorf("error starting dataflow: %v", err)
-		return err
+		return internal.DataflowOutput{}, err
 	}
-	return nil
+	return dfOutput, nil
 }
 
 func toType(dataType string, columnType string, charLen sql.NullInt64, numericPrecision, numericScale sql.NullInt64) schema.Type {
@@ -365,10 +527,6 @@ func toType(dataType string, columnType string, charLen sql.NullInt64, numericPr
 		return schema.Type{Name: dataType, ArrayBounds: []int64{-1}}
 	case charLen.Valid:
 		return schema.Type{Name: dataType, Mods: []int64{charLen.Int64}}
-	case dataType == "decimal" && numericPrecision.Valid && numericScale.Valid && numericScale.Int64 != 0:
-		return schema.Type{Name: dataType, Mods: []int64{numericPrecision.Int64, numericScale.Int64}}
-	case dataType == "decimal" && numericPrecision.Valid:
-		return schema.Type{Name: dataType, Mods: []int64{numericPrecision.Int64}}
 	// We only want to parse the length for tinyints when it is present, in the form tinyint(12). columnType can also be just 'tinyint',
 	// in which case we skip this parsing.
 	case dataType == "tinyint" && len(columnType) > len("tinyint"):
@@ -378,6 +536,10 @@ func toType(dataType string, columnType string, charLen sql.NullInt64, numericPr
 			return schema.Type{Name: dataType}
 		}
 		return schema.Type{Name: dataType, Mods: []int64{length}}
+	case numericPrecision.Valid && numericScale.Valid && numericScale.Int64 != 0:
+		return schema.Type{Name: dataType, Mods: []int64{numericPrecision.Int64, numericScale.Int64}}
+	case numericPrecision.Valid:
+		return schema.Type{Name: dataType, Mods: []int64{numericPrecision.Int64}}
 	default:
 		return schema.Type{Name: dataType}
 	}
@@ -410,4 +572,19 @@ func valsToStrings(vals []sql.RawBytes) []string {
 		s = append(s, toString(v))
 	}
 	return s
+}
+
+func createSequence(conv *internal.Conv) ddl.Sequence {
+	id := internal.GenerateSequenceId()
+	sequenceName := "Sequence" + id[1:]
+	sequence := ddl.Sequence{
+		Id:           id,
+		Name:         sequenceName,
+		SequenceKind: "BIT REVERSED SEQUENCE",
+	}
+	conv.ConvLock.Lock()
+	defer conv.ConvLock.Unlock()
+	srcSequences := conv.SrcSequences
+	srcSequences[id] = sequence
+	return sequence
 }

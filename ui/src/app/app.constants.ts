@@ -1,3 +1,5 @@
+import { MatDialogConfig } from "@angular/material/dialog"
+
 export enum InputType {
   DirectConnect = 'directConnect',
   DumpFile = 'dumpFile',
@@ -24,6 +26,8 @@ export enum ObjectExplorerNodeType {
   Table = 'tableName',
   Indexes = 'indexes',
   Index = 'indexName',
+  Sequences = 'sequences',
+  Sequence = 'sequenceName'
 }
 
 export enum RulesTypes {
@@ -40,6 +44,7 @@ export enum MigrationModes {
 export enum ObjectDetailNodeType {
   Table = 'table',
   Index = 'index',
+  Sequence = 'sequence'
 }
 
 export enum MigrationTypes {
@@ -65,7 +70,11 @@ export enum MigrationDetails {
   HasForeignKeyUpdateStarted = 'hasForeignKeyUpdateStarted',
   ForeignKeyProgressMessage = 'foreignKeyProgressMessage',
   ForeignKeyUpdateProgress = 'foreignKeyUpdateProgress',
-  GeneratingResources = 'generatingResources'
+  GeneratingResources = 'generatingResources',
+  NumberOfShards = 'numberOfShards',
+  NumberOfInstances = 'numberOfInstances',
+  isForeignKeySkipped = 'isForeignKeySkipped',
+  IsGcsMetadataPathSet = 'isGcsMetadataPathSet'
 }
 
 export enum TargetDetails {
@@ -74,7 +83,9 @@ export enum TargetDetails {
   SourceConnProfile = 'sourceConnProfile',
   TargetConnProfile = 'targetConnProfile',
   ReplicationSlot = 'replicationSlot',
-  Publication = 'publication'
+  Publication = 'publication',
+  GcsMetadataName = 'gcsName',
+  GcsMetadataRootPath = 'gcsRootPath'
 }
 
 export const Profile = {
@@ -84,6 +95,11 @@ export const Profile = {
   ExistingConnProfile: 'existing',
 }
 
+export const Dialect = {
+  PostgreSQLDialect: 'postgresql',
+  GoogleStandardSQLDialect: 'google_standard_sql'
+}
+
 export enum ProgressStatus {
 	SchemaMigrationComplete = 1,
 	SchemaCreationInProgress = 2,
@@ -91,4 +107,77 @@ export enum ProgressStatus {
 	DataWriteInProgress = 4,
 	ForeignKeyUpdateInProgress = 5,
   ForeignKeyUpdateComplete = 6
+}
+
+export const DialectList = [
+  { value: 'google_standard_sql', displayName: 'Google Standard SQL Dialect' },
+  { value: 'postgresql', displayName: 'PostgreSQL Dialect' },
+]
+
+export const Datastream = {
+  MaxConcurrentBackfillTasks: 'maxConcurrentBackfillTasks',
+  MaxConcurrentCdcTasks: 'maxConcurrentCdcTasks',
+  IsDatastreamConfigSet: 'isDatastreamConfigSet',
+}
+
+export const Gcs = {
+  TtlInDays: 'ttlInDays',
+  TtlInDaysSet: 'ttlInDaysSet',
+  IsGcsConfigSet: 'isGcsConfigSet',
+}
+
+export const Dataflow = {
+  Network: 'network',
+  Subnetwork: 'subnetwork',
+  VpcHostProjectId: 'vpcHostProjectId',
+  MaxWorkers: 'maxWorkers',
+  NumWorkers: 'numWorkers',
+  ServiceAccountEmail: 'serviceAccountEmail',
+  MachineType: 'machineType',
+  AdditionalUserLabels: 'additionalUserLabels',
+  KmsKeyName: 'kmsKeyName',
+  ProjectId: 'dataflowProjectId',
+  Location: 'dataflowLocation',
+  GcsTemplatePath: 'gcsTemplatePath',
+  IsDataflowConfigSet: 'isDataflowConfigSet',
+  CustomJarPath: 'customJarPath',
+  CustomClassName: 'customClassName',
+  CustomParameter: 'customParameter'
+}
+
+export const ColLength = {
+  StorageMaxLength: 9223372036854775807,
+  StringMaxLength: 2621440,
+  ByteMaxLength: 10485760,
+  DataTypes: ['STRING','BYTES','VARCHAR']
+}
+
+export const DataTypes = {
+  GoogleStandardSQL : ['BOOL','BYTES','DATE','FLOAT64','INT64','STRING', 'TIMESTAMP', 'NUMERIC', 'JSON'],
+  PostgreSQL : ['BOOL','BYTEA','DATE','FLOAT8','INT8','VARCHAR', 'TIMESTAMPTZ', 'NUMERIC', 'JSONB']
+}
+
+export enum PersistedFormValues {
+    DirectConnectForm = 'directConnectForm',
+    IsConnectionSuccessful = 'isConnectionSuccessful'
+}
+
+export const autoGenSupportedDbs: string[] = ['MySQL']
+
+export const dialogConfigAddSequence: MatDialogConfig<any> = {
+  width: '50%',
+  minWidth: '40%',
+  maxWidth: '70%',
+}
+
+export const dialogConfigDropComponent: MatDialogConfig<any> = {
+  width: '100%',
+  minWidth: '50%',
+  maxWidth: '75%',
+}
+
+export const dialogDefault: MatDialogConfig<any> = {
+  width: '30vw',
+  minWidth: '400px',
+  maxWidth: '500px',
 }

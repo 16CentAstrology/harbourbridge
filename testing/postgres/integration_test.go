@@ -29,9 +29,10 @@ import (
 
 	"cloud.google.com/go/spanner"
 	database "cloud.google.com/go/spanner/admin/database/apiv1"
-	"github.com/cloudspannerecosystem/harbourbridge/common/constants"
-	"github.com/cloudspannerecosystem/harbourbridge/common/utils"
-	"github.com/cloudspannerecosystem/harbourbridge/testing/common"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/constants"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/common/utils"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/testing/common"
+	"github.com/stretchr/testify/assert"
 	"google.golang.org/api/iterator"
 	databasepb "google.golang.org/genproto/googleapis/spanner/admin/database/v1"
 )
@@ -52,8 +53,8 @@ func TestMain(m *testing.M) {
 }
 
 func initIntegrationTests() (cleanup func()) {
-	projectID = os.Getenv("HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID")
-	instanceID = os.Getenv("HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID")
+	projectID = os.Getenv("SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID")
+	instanceID = os.Getenv("SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID")
 
 	ctx = context.Background()
 	flag.Parse() // Needed for testing.Short().
@@ -65,12 +66,12 @@ func initIntegrationTests() (cleanup func()) {
 	}
 
 	if projectID == "" {
-		log.Println("Integration tests skipped: HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID is missing")
+		log.Println("Integration tests skipped: SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID is missing")
 		return noop
 	}
 
 	if instanceID == "" {
-		log.Println("Integration tests skipped: HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID is missing")
+		log.Println("Integration tests skipped: SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID is missing")
 		return noop
 	}
 
@@ -105,44 +106,22 @@ func prepareIntegrationTest(t *testing.T) string {
 	return tmpdir
 }
 
-func TestIntegration_PGDUMP_Command(t *testing.T) {
-	t.Parallel()
-
-	tmpdir := prepareIntegrationTest(t)
-	defer os.RemoveAll(tmpdir)
-
-	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.PGDUMP, now)
-	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-
-	dataFilepath := "../../test_data/pg_dump.test.out"
-	filePrefix := filepath.Join(tmpdir, dbName+".")
-
-	args := fmt.Sprintf("-prefix %s -instance %s -dbname %s < %s", filePrefix, instanceID, dbName, dataFilepath)
-	err := common.RunCommand(args, projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Drop the database later.
-	defer dropDatabase(t, dbURI)
-
-	checkResults(t, dbURI)
-}
-
 func TestIntegration_PGDUMP_SchemaAndDataSubcommand(t *testing.T) {
+	onlyRunForEmulatorTest(t)
 	t.Parallel()
 
 	tmpdir := prepareIntegrationTest(t)
 	defer os.RemoveAll(tmpdir)
 
 	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.PGDUMP, now)
+	g := utils.GetUtilInfoImpl{}
+	dbName, _ := g.GetDatabaseName(constants.PGDUMP, now)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
 
 	dataFilepath := "../../test_data/pg_dump.test.out"
-	filePrefix := filepath.Join(tmpdir, dbName+".")
+	filePrefix := filepath.Join(tmpdir, dbName)
 
-	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s' < %s", filePrefix, instanceID, dbName, dataFilepath)
+	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s,project=%s' < %s", filePrefix, instanceID, dbName, projectID, dataFilepath)
 	err := common.RunCommand(args, projectID)
 	if err != nil {
 		t.Fatal(err)
@@ -154,47 +133,30 @@ func TestIntegration_PGDUMP_SchemaAndDataSubcommand(t *testing.T) {
 }
 
 func TestIntegration_PGDUMP_SchemaSubcommand(t *testing.T) {
-	onlyRunForEmulatorTest(t)
-	t.Parallel()
+	for _, d := range []string{"google_standard_sql", "postgresql"} {
+		dialect := d
+		t.Run(dialect, func(t *testing.T) {
+			onlyRunForEmulatorTest(t)
+			t.Parallel()
 
-	tmpdir := prepareIntegrationTest(t)
-	defer os.RemoveAll(tmpdir)
-	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.PGDUMP, now)
-	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
+			tmpdir := prepareIntegrationTest(t)
+			defer os.RemoveAll(tmpdir)
+			now := time.Now()
+			g := utils.GetUtilInfoImpl{}
+			dbName, _ := g.GetDatabaseName(constants.PGDUMP, now)
+			dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
 
-	dataFilepath := "../../test_data/pg_dump.test.out"
+			dataFilepath := "../../test_data/pg_dump.test.out"
 
-	args := fmt.Sprintf("schema -source=pg -target-profile='instance=%s,dbName=%s' < %s", instanceID, dbName, dataFilepath)
-	err := common.RunCommand(args, projectID)
-	if err != nil {
-		t.Fatal(err)
+			args := fmt.Sprintf("schema -source=pg -target-profile='instance=%s,dbName=%s,dialect=%s,project=%s' < %s", instanceID, dbName, dialect, projectID, dataFilepath)
+			err := common.RunCommand(args, projectID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Drop the database later.
+			defer dropDatabase(t, dbURI)
+		})
 	}
-	// Drop the database later.
-	defer dropDatabase(t, dbURI)
-}
-
-func TestIntegration_POSTGRES_Command(t *testing.T) {
-	onlyRunForEmulatorTest(t)
-	t.Parallel()
-
-	tmpdir := prepareIntegrationTest(t)
-	defer os.RemoveAll(tmpdir)
-
-	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.POSTGRES, now)
-	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
-
-	args := fmt.Sprintf("-instance %s -dbname %s -prefix %s -driver %s", instanceID, dbName, filePrefix, constants.POSTGRES)
-	err := common.RunCommand(args, projectID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Drop the database later.
-	defer dropDatabase(t, dbURI)
-
-	checkResults(t, dbURI)
 }
 
 func TestIntegration_POSTGRES_SchemaAndDataSubcommand(t *testing.T) {
@@ -205,11 +167,12 @@ func TestIntegration_POSTGRES_SchemaAndDataSubcommand(t *testing.T) {
 	defer os.RemoveAll(tmpdir)
 
 	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.POSTGRES, now)
+	g := utils.GetUtilInfoImpl{}
+	dbName, _ := g.GetDatabaseName(constants.POSTGRES, now)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
+	filePrefix := filepath.Join(tmpdir, dbName)
 
-	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s'", filePrefix, instanceID, dbName)
+	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s,project=%s'", filePrefix, instanceID, dbName, projectID)
 	err := common.RunCommand(args, projectID)
 	if err != nil {
 		t.Fatal(err)
@@ -226,19 +189,67 @@ func TestIntegration_POSTGRES_SchemaSubcommand(t *testing.T) {
 
 	tmpdir := prepareIntegrationTest(t)
 	defer os.RemoveAll(tmpdir)
+	now := time.Now()
+	g := utils.GetUtilInfoImpl{}
+	dbName, _ := g.GetDatabaseName(constants.POSTGRES, now)
+	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
+	filePrefix := filepath.Join(tmpdir, dbName)
+
+	args := fmt.Sprintf("schema -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s,project=%s'", filePrefix, instanceID, dbName, projectID)
+	err := common.RunCommand(args, "emulator-test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer dropDatabase(t, dbURI)
+}
+
+func TestIntegration_PGDUMP_ForeignKeyActionMigration(t *testing.T) {
+	onlyRunForEmulatorTest(t)
+	t.Parallel()
+
+	tmpdir := prepareIntegrationTest(t)
+	defer os.RemoveAll(tmpdir)
 
 	now := time.Now()
-	dbName, _ := utils.GetDatabaseName(constants.POSTGRES, now)
+	g := utils.GetUtilInfoImpl{}
+	dbName, _ := g.GetDatabaseName(constants.PGDUMP, now)
 	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
-	filePrefix := filepath.Join(tmpdir, dbName+".")
 
-	args := fmt.Sprintf("schema -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s'", filePrefix, instanceID, dbName)
-	err := common.RunCommand(args, projectID)
+	dataFilepath := "../../test_data/pg_dump.test.out"
+	filePrefix := filepath.Join(tmpdir, dbName)
+
+	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=test-instance,dbName=%s,project=%s' < %s", filePrefix, dbName, projectID, dataFilepath)
+	err := common.RunCommand(args, "emulator-test-project")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Drop the database later.
 	defer dropDatabase(t, dbURI)
+
+	checkForeignKeyActions(ctx, t, dbURI)
+}
+
+func TestIntegration_POSTGRES_ForeignKeyActionMigration(t *testing.T) {
+	onlyRunForEmulatorTest(t)
+	t.Parallel()
+
+	tmpdir := prepareIntegrationTest(t)
+	defer os.RemoveAll(tmpdir)
+
+	now := time.Now()
+	g := utils.GetUtilInfoImpl{}
+	dbName, _ := g.GetDatabaseName(constants.POSTGRES, now)
+	dbURI := fmt.Sprintf("projects/%s/instances/%s/databases/%s", projectID, instanceID, dbName)
+	filePrefix := filepath.Join(tmpdir, dbName)
+
+	args := fmt.Sprintf("schema-and-data -prefix %s -source=postgres -target-profile='instance=%s,dbName=%s,project=%s'", filePrefix, instanceID, dbName, projectID)
+	err := common.RunCommand(args, "emulator-test-project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dropDatabase(t, dbURI)
+	checkForeignKeyActions(ctx, t, dbURI)
 }
 
 func checkResults(t *testing.T, dbURI string) {
@@ -346,8 +357,8 @@ func checkCoreTypes(ctx context.Context, t *testing.T, client *spanner.Client) {
 }
 
 func checkArrays(ctx context.Context, t *testing.T, client *spanner.Client) {
-	var ints []int64
-	var strs []string
+	var ints string
+	var strs string
 	iter := client.Single().Read(ctx, "test3", spanner.Key{1}, []string{"a", "b"})
 	defer iter.Stop()
 	for {
@@ -362,12 +373,47 @@ func checkArrays(ctx context.Context, t *testing.T, client *spanner.Client) {
 			t.Fatal(err)
 		}
 	}
-	if got, want := ints, []int64{1, 2, 3}; !reflect.DeepEqual(got, want) {
+	if got, want := ints, "{1,2,3}"; !reflect.DeepEqual(got, want) {
 		t.Fatalf("integer array is not correct: got %v, want %v", got, want)
 	}
-	if got, want := strs, []string{"1", "nice", "foo"}; !reflect.DeepEqual(got, want) {
+	if got, want := strs, "{1,nice,foo}"; !reflect.DeepEqual(got, want) {
 		t.Fatalf("string array is not correct: got %v, want %v", got, want)
 	}
+}
+
+func checkForeignKeyActions(ctx context.Context, t *testing.T, dbURI string) {
+	client, err := spanner.NewClient(ctx, dbURI)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	// Verifying that the row to be deleted exists in parent - otherwise testing would be incorrect
+	stmt := spanner.Statement{SQL: `SELECT * FROM products WHERE productid = '1YMWWN1N4O'`}
+	iter := client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+	row, _ := iter.Next()
+	assert.NotNil(t, row, "Expected rows with product_id \"1YMWWN1N4O\" in table 'products'")
+
+	// Deleting row from parent table in Spanner DB
+	mutation := spanner.Delete("products", spanner.Key{"1YMWWN1N4O"})
+	_, err = client.Apply(ctx, []*spanner.Mutation{mutation})
+	if err != nil {
+		t.Fatalf("Failed to delete row: %v", err)
+	}
+
+	// Testing ON DELETE NO ACTION - row shouldn't have been deleted in parent and child
+	stmt = spanner.Statement{SQL: `SELECT * FROM products WHERE productid = '1YMWWN1N4O'`}
+	iter = client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+	row, _ = iter.Next()
+	assert.NotNil(t, row, "Expected rows in table 'products' with productid '1YMWWN1N4O' to still exist")
+
+	stmt = spanner.Statement{SQL: `SELECT * FROM cart WHERE productid = '1YMWWN1N4O'`}
+	iter = client.Single().Query(ctx, stmt)
+	defer iter.Stop()
+	row, err = iter.Next()
+	assert.NotNil(t, row, "Expected rows in table 'cart' with productid '1YMWWN1N4O' to still exist")
 }
 
 func onlyRunForEmulatorTest(t *testing.T) {

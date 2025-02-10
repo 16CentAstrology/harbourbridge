@@ -37,6 +37,8 @@ jobs:
       MYSQLPORT: 3306
       MYSQLUSER: root
       MYSQLDATABASE: test_interleave_table_data
+      MYSQLDB_FKACTION: test_foreign_key_action_data
+      MYSQLDB_CHECK_CONSTRAINT: test_mysql_checkconstraint
       MYSQLPWD: root
 
       # set DynamoDB related environment variables
@@ -51,7 +53,7 @@ jobs:
 
     services:
       spanner_emulator:
-        image: gcr.io/cloud-spanner-emulator/emulator:1.4.0
+        image: gcr.io/cloud-spanner-emulator/emulator:1.5.28
         ports:
           - 9010:9010
           - 9020:9020
@@ -66,7 +68,7 @@ jobs:
         # needed because the postgres container does not provide a healthcheck
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
       mariadb:
-        image: mariadb:10.3
+        image: mariadb:10.11
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: test
@@ -80,7 +82,7 @@ jobs:
           - 8000:8000
         options: --workdir /home/dynamodblocal --health-cmd "curl --fail http://127.0.0.1:8000/shell/ || exit 1" --health-interval 10s --health-timeout 5s --health-retries 5
       sqlserver:
-        image: mcr.microsoft.com/mssql/server
+        image: mcr.microsoft.com/mssql/server:2022-latest
         env:
           SA_PASSWORD: ${{env.MSSQL_SA_PASSWORD}}
           MSSQL_PID: Express
@@ -88,7 +90,7 @@ jobs:
         ports:
           - 1433:1433
         options:
-          --health-cmd "/opt/mssql-tools/bin/sqlcmd -U sa -P $SA_PASSWORD -Q 'select 1' -b -o /dev/null"
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -U sa -P $SA_PASSWORD -Q 'select 1' -b -No -o /dev/null"
           --health-interval 10s --health-timeout 5s --health-retries 3
       oracle:
         image: oracleinanutshell/oracle-xe-11g
@@ -96,15 +98,13 @@ jobs:
           - 1521:1521
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
       # init a PostgresSQL database from the test_data
       - name: Install PostgreSQL 12 client required for loading .sql files
         run: |
-          sudo bash -c "echo deb http://apt.postgresql.org/pub/repos/apt/ bionic-pgdg main >> /etc/apt/sources.list.d/pgdg.list"
-          wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo apt-get update
-          sudo apt-get -yq install libpq-dev postgresql-client-12
+          sudo apt-get -yq install postgresql-client
       - run: psql --version
       - run: psql -f test_data/pg_dump.test.out
 
@@ -112,28 +112,39 @@ jobs:
       - run: mysql --version
       - run: mysql -v -P 3306 --protocol=tcp -u root -proot test < test_data/mysqldump.test.out
       - run: mysql -v -P 3306 --protocol=tcp -u root -proot < test_data/mysql_interleave_dump.test.out
+      - run: mysql -v -P 3306 --protocol=tcp -u root -proot < test_data/mysql_foreignkeyaction_dump.test.out
+      - run: mysql -v -P 3306 --protocol=tcp -u root -proot < test_data/mysql_checkconstraint_dump.test.out
 
       # init sql server with test_data
+      # since we use ubuntu-latest container, we should ensure that the path matches the latest from  https://packages.microsoft.com/config/ubuntu/
+      # while its possible to infer the latest from the path in the run script, it will make the run section more complex and hard to maintian.
       - name: Install sqlcmd required for loading .sql files
         run: |
           curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
-          curl https://packages.microsoft.com/config/ubuntu/16.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
-          sudo apt-get update 
-          sudo apt-get install mssql-tools unixodbc-dev
-          echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bash_profile
-      - run: sqlcmd -?
-      - run: sqlcmd -U sa -P ${MSSQL_SA_PASSWORD} -i test_data/sqlserver.test.out
+          curl https://packages.microsoft.com/config/ubuntu/24.04/prod.list | sudo tee /etc/apt/sources.list.d/msprod.list
+          sudo apt-get update
+          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18
+          sudo apt-get install mssql-tools18 unixodbc-dev
+          set -x
+          ls /opt/mssql-tools18/bin/
+          set +x
+          echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+      - run: /opt/mssql-tools18/bin/sqlcmd -C -?
+      - run: /opt/mssql-tools18/bin/sqlcmd -U sa -P ${MSSQL_SA_PASSWORD} -i test_data/sqlserver.test.out -C
 
       # sqlplus set up init oracle db.
       - name: Install sqlplus required for loading .sql files
         run: |
           sudo apt-get update
-          sudo apt install alien libaio1
-          curl -O https://download.oracle.com/otn_software/linux/instantclient/215000/oracle-instantclient-basic-21.5.0.0.0-1.x86_64.rpm          
-          curl -O https://download.oracle.com/otn_software/linux/instantclient/215000/oracle-instantclient-sqlplus-21.5.0.0.0-1.x86_64.rpm
-          sudo alien -i oracle-instantclient-basic-21.5.0.0.0-1.x86_64.rpm
-          sudo alien -i oracle-instantclient-sqlplus-21.5.0.0.0-1.x86_64.rpm
-          sudo sh -c 'echo /usr/lib/oracle/21.5/client64/lib/ > /etc/ld.so.conf.d/oracle.conf'
+          sudo apt-get install -y libaio1t64 rpm2cpio cpio
+          sudo ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 /usr/lib/libaio.so.1
+          curl -O https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm
+          curl -O https://download.oracle.com/otn_software/linux/instantclient/2340000/oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm
+          rpm2cpio oracle-instantclient-basic-23.4.0.24.05-1.el9.x86_64.rpm | sudo cpio -idmv
+          sudo cp -r usr/* /usr/
+          rpm2cpio oracle-instantclient-sqlplus-23.4.0.24.05-1.el9.x86_64.rpm | sudo cpio -idmv
+          sudo cp -r usr/* /usr/
+          sudo sh -c 'echo /usr/lib/oracle/23/client64/lib/ > /etc/ld.so.conf.d/oracle.conf'
           sudo ldconfig
       - run: sqlplus SYS/oracle@127.0.0.1:1521/xe as sysdba @test_data/oracle.test.out
       # create a spanner instance
@@ -150,7 +161,29 @@ jobs:
       - run: gcloud config set api_endpoint_overrides/spanner http://localhost:9020/
       - run: gcloud spanner instances create test-instance --config=emulator-config --description="Test Instance" --nodes=1
 
-      # run tests
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: 16
+
+      - name: Install Dependencies
+        run: |
+          cd ui
+          npm ci
+
+      - name: Start Local Server
+        run:  |
+          cd ui
+          npm start &
+
+      - name: Wait for Local Server to Start
+        run: npx wait-on http://localhost:4200 -t 30000
+
+      - name: Cypress run
+        run: |
+          cd ui
+          npx cypress run
+
       - uses: actions/setup-go@v2
         with:
           go-version: "1.19"
@@ -158,5 +191,5 @@ jobs:
       - run: go test -v ./...
         env:
           SPANNER_EMULATOR_HOST: localhost:9010
-          HARBOURBRIDGE_TESTS_GCLOUD_PROJECT_ID: emulator-test-project
-          HARBOURBRIDGE_TESTS_GCLOUD_INSTANCE_ID: test-instance
+          SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_PROJECT_ID: emulator-test-project
+          SPANNER_MIGRATION_TOOL_TESTS_GCLOUD_INSTANCE_ID: test-instance

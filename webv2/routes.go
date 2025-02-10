@@ -15,16 +15,24 @@
 package webv2
 
 import (
+	"context"
 	"io/fs"
 	"net/http"
 
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/config"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/primarykey"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/profile"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/session"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/summary"
-	"github.com/cloudspannerecosystem/harbourbridge/webv2/table"
-
+	ds "github.com/GoogleCloudPlatform/spanner-migration-tool/accessors/clients/datastream"
+	storageclient "github.com/GoogleCloudPlatform/spanner-migration-tool/accessors/clients/storage"
+	datastream_accessor "github.com/GoogleCloudPlatform/spanner-migration-tool/accessors/datastream"
+	spanneraccessor "github.com/GoogleCloudPlatform/spanner-migration-tool/accessors/spanner"
+	storageaccessor "github.com/GoogleCloudPlatform/spanner-migration-tool/accessors/storage"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/conversion"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/expressions_api"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/api"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/config"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/primarykey"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/profile"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/session"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/summary"
+	"github.com/GoogleCloudPlatform/spanner-migration-tool/webv2/table"
 	"github.com/gorilla/mux"
 )
 
@@ -32,38 +40,73 @@ func getRoutes() *mux.Router {
 	router := mux.NewRouter().StrictSlash(true)
 	frontendRoot, _ := fs.Sub(FrontendDir, "ui/dist/ui")
 	frontendStatic := http.FileServer(http.FS(frontendRoot))
+	reportAPIHandler := api.ReportAPIHandler{
+		Report: &conversion.ReportImpl{},
+	}
+	ctx := context.Background()
+	ddlVerifier, _ := expressions_api.NewDDLVerifierImpl(ctx, "", "")
+	tableHandler := api.TableAPIHandler{
+		DDLVerifier: ddlVerifier,
+	}
+	spanneraccessor, _ := spanneraccessor.NewSpannerAccessorClientImpl(ctx)
+	dsClient, _ := ds.NewDatastreamClientImpl(ctx)
+	storageclient, _ := storageclient.NewStorageClientImpl(ctx)
+	validateResourceImpl := conversion.NewValidateResourcesImpl(spanneraccessor, &datastream_accessor.DatastreamAccessorImpl{},
+		dsClient, &storageaccessor.StorageAccessorImpl{}, storageclient)
+	profileAPIHandler := profile.ProfileAPIHandler{
+		ValidateResources: validateResourceImpl,
+	}
+
+	expressionVerificationAccessor, _ := expressions_api.NewExpressionVerificationAccessorImpl(ctx, session.GetSessionState().SpannerProjectId, session.GetSessionState().SpannerInstanceID)
+
+	expressionVerificationHandler := api.ExpressionsVerificationHandler{
+		ExpressionVerificationAccessor: expressionVerificationAccessor,
+	}
+
 	router.HandleFunc("/connect", databaseConnection).Methods("POST")
-	router.HandleFunc("/convert/infoschema", convertSchemaSQL).Methods("GET")
-	router.HandleFunc("/convert/dump", convertSchemaDump).Methods("POST")
+	router.HandleFunc("/convert/infoschema", expressionVerificationHandler.ConvertSchemaSQL).Methods("GET")
+	router.HandleFunc("/convert/dump", expressionVerificationHandler.ConvertSchemaDump).Methods("POST")
 	router.HandleFunc("/convert/session", loadSession).Methods("POST")
-	router.HandleFunc("/ddl", getDDL).Methods("GET")
-	router.HandleFunc("/overview", getOverview).Methods("GET")
-	router.HandleFunc("/conversion", getConversionRate).Methods("GET")
-	router.HandleFunc("/typemap", getTypeMap).Methods("GET")
-	router.HandleFunc("/report", getReportFile).Methods("GET")
+	router.HandleFunc("/ddl", api.GetDDL).Methods("GET")
+	router.HandleFunc("/seqDdl", api.GetSequenceDDL).Methods("GET")
+	router.HandleFunc("/conversion", api.GetConversionRate).Methods("GET")
+	router.HandleFunc("/typemap", api.GetTypeMap).Methods("GET")
+	router.HandleFunc("/report", reportAPIHandler.GetReportFile).Methods("GET")
+	router.HandleFunc("/downloadStructuredReport", reportAPIHandler.GetDStructuredReport).Methods("GET")
+	router.HandleFunc("/downloadTextReport", reportAPIHandler.GetDTextReport).Methods("GET")
+	router.HandleFunc("/downloadDDL", api.GetDSpannerDDL).Methods("GET")
 	router.HandleFunc("/schema", getSchemaFile).Methods("GET")
-	router.HandleFunc("/applyrule", applyRule).Methods("POST")
-	router.HandleFunc("/dropRule", dropRule).Methods("POST")
+	router.HandleFunc("/applyrule", api.ApplyRule).Methods("POST")
+	router.HandleFunc("/dropRule", api.DropRule).Methods("POST")
 	router.HandleFunc("/typemap/table", table.UpdateTableSchema).Methods("POST")
 	router.HandleFunc("/typemap/reviewTableSchema", table.ReviewTableSchema).Methods("POST")
-
-	router.HandleFunc("/setparent", setParentTable).Methods("GET")
-	router.HandleFunc("/removeParent", removeParentTable).Methods("POST")
+	router.HandleFunc("/typemap/GetStandardTypeToPGSQLTypemap", api.GetStandardTypeToPGSQLTypemap).Methods("GET")
+	router.HandleFunc("/typemap/GetPGSQLToStandardTypeTypemap", api.GetPGSQLToStandardTypeTypemap).Methods("GET")
+	router.HandleFunc("/spannerDefaultTypeMap", api.SpannerDefaultTypeMap).Methods("GET")
+	router.HandleFunc("/autoGenMap", api.GetAutoGenMap).Methods("GET")
+	router.HandleFunc("/getSequenceKind", api.GetSequenceKind).Methods("GET")
+	router.HandleFunc("/setparent", api.SetParentTable).Methods("GET")
+	router.HandleFunc("/removeParent", api.RemoveParentTable).Methods("POST")
+	router.HandleFunc("/verifyCheckConstraintExpression", expressionVerificationHandler.VerifyCheckConstraintExpression).Methods("GET")
 
 	// TODO:(searce) take constraint names themselves which are guaranteed to be unique for Spanner.
-	router.HandleFunc("/drop/secondaryindex", dropSecondaryIndex).Methods("POST")
-	router.HandleFunc("/restore/secondaryIndex", restoreSecondaryIndex).Methods("POST")
+	router.HandleFunc("/drop/secondaryindex", api.DropSecondaryIndex).Methods("POST")
+	router.HandleFunc("/restore/secondaryIndex", api.RestoreSecondaryIndex).Methods("POST")
 
-	router.HandleFunc("/restore/table", restoreTable).Methods("POST")
-	router.HandleFunc("/drop/table", dropTable).Methods("POST")
+	router.HandleFunc("/restore/table", tableHandler.RestoreTable).Methods("POST")
+	router.HandleFunc("/restore/tables", tableHandler.RestoreTables).Methods("POST")
+	router.HandleFunc("/drop/table", api.DropTable).Methods("POST")
+	router.HandleFunc("/drop/tables", api.DropTables).Methods("POST")
 
-	router.HandleFunc("/update/fks", updateForeignKeys).Methods("POST")
-	router.HandleFunc("/rename/indexes", renameIndexes).Methods("POST")
-	router.HandleFunc("/update/indexes", updateIndexes).Methods("POST")
+	router.HandleFunc("/drop/sequence", api.DropSequence).Methods("POST")
+	router.HandleFunc("/UpdateSequence", api.UpdateSequence).Methods("POST")
+
+	router.HandleFunc("/update/fks", api.UpdateForeignKeys).Methods("POST")
+	router.HandleFunc("/update/cc", api.UpdateCheckConstraint).Methods("POST")
+	router.HandleFunc("/update/indexes", api.UpdateIndexes).Methods("POST")
 
 	// Session Management
 	router.HandleFunc("/IsOffline", session.IsOfflineSession).Methods("GET")
-	router.HandleFunc("/InitiateSession", session.InitiateSession).Methods("POST")
 	router.HandleFunc("/GetSessions", session.GetSessions).Methods("GET")
 	router.HandleFunc("/GetSession/{versionId}", session.GetConv).Methods("GET")
 	router.HandleFunc("/SaveRemoteSession", session.SaveRemoteSession).Methods("POST")
@@ -72,13 +115,19 @@ func getRoutes() *mux.Router {
 	// primarykey
 	router.HandleFunc("/primaryKey", primarykey.PrimaryKey).Methods("POST")
 
+	router.HandleFunc("/AddColumn", table.AddNewColumn).Methods("POST")
+	router.HandleFunc("/AddSequence", api.AddNewSequence).Methods("POST")
+
 	// Summary
 	router.HandleFunc("/summary", summary.GetSummary).Methods("GET")
+
+	// Issue Description
+	router.HandleFunc("/issueDescription", getIssueDescription).Methods("GET")
 
 	// Application Configuration
 	router.HandleFunc("/GetConfig", config.GetConfig).Methods("GET")
 	router.HandleFunc("/SetSpannerConfig", config.SetSpannerConfig).Methods("POST")
-
+	router.HandleFunc("/IsConfigSet", config.IsConfigSet).Methods("GET")
 	// Run migration
 	router.HandleFunc("/Migrate", migrate).Methods("POST")
 
@@ -92,13 +141,24 @@ func getRoutes() *mux.Router {
 	router.HandleFunc("/GetStaticIps", profile.GetStaticIps).Methods("GET")
 	router.HandleFunc("/CreateConnectionProfile", profile.CreateConnectionProfile).Methods("POST")
 
+	// Verify JSON Configuration
+	router.HandleFunc("/VerifyJsonConfiguration", profileAPIHandler.VerifyJsonConfiguration).Methods("POST")
+
 	// Clean up datastream and data flow jobs
 	router.HandleFunc("/CleanUpStreamingJobs", profile.CleanUpStreamingJobs).Methods("POST")
 
 	router.HandleFunc("/SetSourceDBDetailsForDump", setSourceDBDetailsForDump).Methods("POST")
 	router.HandleFunc("/SetSourceDBDetailsForDirectConnect", setSourceDBDetailsForDirectConnect).Methods("POST")
-
+	router.HandleFunc("/SetShardsSourceDBDetailsForBulk", setShardsSourceDBDetailsForBulk).Methods("POST")
+	router.HandleFunc("/SetShardsSourceDBDetailsForDataflow", setShardsSourceDBDetailsForDataflow).Methods("POST")
+	router.HandleFunc("/SetDatastreamDetailsForShardedMigrations", setDatastreamDetailsForShardedMigrations).Methods("POST")
+	router.HandleFunc("/SetGcsDetailsForShardedMigrations", setGcsDetailsForShardedMigrations).Methods("POST")
+	router.HandleFunc("/SetDataflowDetailsForShardedMigrations", setDataflowDetailsForShardedMigrations).Methods("POST")
+	router.HandleFunc("/GetSourceProfileConfig", getSourceProfileConfig).Methods("GET")
 	router.HandleFunc("/uploadFile", uploadFile).Methods("POST")
+
+	router.HandleFunc("/GetTableWithErrors", tableHandler.GetTableWithErrors).Methods("GET")
+	router.HandleFunc("/ping", getBackendHealth).Methods("GET")
 
 	router.PathPrefix("/").Handler(frontendStatic)
 	return router

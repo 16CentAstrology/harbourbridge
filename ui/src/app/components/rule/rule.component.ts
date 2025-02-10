@@ -1,6 +1,7 @@
 import { Component, EventEmitter, Input, OnInit, Output, SimpleChanges } from '@angular/core'
 import { SidenavService } from 'src/app/services/sidenav/sidenav.service'
 import { DataService } from 'src/app/services/data/data.service'
+import { FlatNode } from 'src/app/model/schema-object-node'
 
 @Component({
   selector: 'app-rule',
@@ -11,10 +12,10 @@ export class RuleComponent implements OnInit {
   dataSource: any = []
   currentDataSource: any = []
   displayedColumns = ['order', 'name', 'type', 'objectType', 'associatedObject', 'enabled', 'view']
-  @Input() currentObject: any = {}
+  @Input() currentObject: FlatNode | null = null
   @Output() lengthOfRules: EventEmitter<number> = new EventEmitter<number>()
 
-  constructor(private sidenavService: SidenavService, private data: DataService) {}
+  constructor(private sidenavService: SidenavService, private data: DataService) { }
 
   ngOnInit(): void {
     this.dataSource = []
@@ -35,17 +36,32 @@ export class RuleComponent implements OnInit {
       let globalData: any = []
       let currentData: any = []
       globalData = this.currentDataSource.filter(
-        (index: any) => index?.Type === 'global_datatype_change'
+        (rule: any) => rule?.Type === 'global_datatype_change' ||
+          rule?.Type === 'add_shard_id_primary_key' ||
+          (rule?.Type === 'edit_column_max_length' && rule?.AssociatedObjects === 'All table')
       )
       if (
         this.currentObject &&
         (this.currentObject?.type === 'tableName' || this.currentObject?.type === 'indexName')
       ) {
-        currentData = this.currentDataSource.filter(
-          (index: any) =>
-            index?.AssociatedObjects === this.currentObject?.name ||
-            index?.AssociatedObjects === this.currentObject?.parent
-        )
+        currentData = this.currentDataSource
+          .filter(
+            (rule: any) =>
+              rule?.AssociatedObjects === this.currentObject?.id ||
+              rule?.AssociatedObjects === this.currentObject?.parentId ||
+              rule?.AssociatedObjects === this.currentObject?.name ||
+              rule?.AssociatedObjects === this.currentObject?.parent
+          )
+          .map((rule: any) => {
+            let tableName: string = ''
+            if (this.currentObject?.type === 'tableName') {
+              tableName = this.currentObject.name
+            } else if (this.currentObject?.type === 'indexName') {
+              tableName = this.currentObject.parent
+            }
+            rule.AssociatedObjects = tableName
+            return rule
+          })
       }
       this.dataSource = [...globalData, ...currentData]
       this.lengthOfRules.emit(this.dataSource.length)
@@ -58,7 +74,9 @@ export class RuleComponent implements OnInit {
   openSidenav(): void {
     this.sidenavService.openSidenav()
     this.sidenavService.setSidenavComponent('rule')
-    this.sidenavService.passRule([], false)
+    this.sidenavService.setSidenavRuleType('')
+    this.sidenavService.setRuleData({})
+    this.sidenavService.setDisplayRuleFlag(false)
   }
 
   viewSidenavRule(Id: any): void {
@@ -72,6 +90,7 @@ export class RuleComponent implements OnInit {
 
     this.sidenavService.openSidenav()
     this.sidenavService.setSidenavComponent('rule')
-    this.sidenavService.passRule(selectedRule, true)
+    this.sidenavService.setRuleData(selectedRule)
+    this.sidenavService.setDisplayRuleFlag(true)
   }
 }

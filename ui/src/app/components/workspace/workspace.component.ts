@@ -2,20 +2,25 @@ import { Component, OnDestroy, OnInit } from '@angular/core'
 import { DataService } from 'src/app/services/data/data.service'
 import { ConversionService } from '../../services/conversion/conversion.service'
 import { SidenavService } from 'src/app/services/sidenav/sidenav.service'
-import IConv from '../../model/conv'
+import IConv, { ITableIdAndName, IType } from '../../model/conv'
 import { Subscription } from 'rxjs/internal/Subscription'
 import { MatDialog } from '@angular/material/dialog'
 import IFkTabData from 'src/app/model/fk-tab-data'
-import IColumnTabData, { IIndexData } from '../../model/edit-table'
+import IColumnTabData, { IIndexData, ISequenceData } from '../../model/edit-table'
 import ISchemaObjectNode, { FlatNode } from 'src/app/model/schema-object-node'
 import { InputType, ObjectExplorerNodeType, StorageKeys } from 'src/app/app.constants'
 import { IUpdateTableArgument } from 'src/app/model/update-table'
 import ConversionRate from 'src/app/model/conversion-rate'
 import { Router } from '@angular/router'
-import { extractSourceDbName } from 'src/app/utils/utils'
+import { downloadSession, extractSourceDbName } from 'src/app/utils/utils'
 import { ClickEventService } from 'src/app/services/click-event/click-event.service'
 import IViewAssesmentData from 'src/app/model/view-assesment'
 import IDbConfig from 'src/app/model/db-config'
+import { InfodialogComponent } from '../infodialog/infodialog.component'
+import { FetchService } from 'src/app/services/fetch/fetch.service'
+import IStructuredReport from '../../model/structured-report'
+import * as JSZip from 'jszip'
+import ICcTabData from 'src/app/model/cc-tab-data'
 
 @Component({
   selector: 'app-workspace',
@@ -28,13 +33,19 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
   currentObject: FlatNode | null
   tableData: IColumnTabData[] = []
   indexData: IIndexData[] = []
+  sequenceData: ISequenceData = {}
   typeMap: Record<string, Record<string, string>> | boolean = false
+  defaultTypeMap: Record<string, IType> | boolean = false
   conversionRates: Record<string, string> = {}
+  autoGenMap: Record<string, Record<string, string>> | boolean = false
   typemapObj!: Subscription
+  defaultTypemapObj!: Subscription
+  autoGenMapObj!: Subscription
   convObj!: Subscription
   converObj!: Subscription
   ddlsumconvObj!: Subscription
   ddlObj!: Subscription
+  rerenderObj!: Subscription;
   isLeftColumnCollapse: boolean = false
   isRightColumnCollapse: boolean = true
   isMiddleColumnCollapse: boolean = true
@@ -49,22 +60,31 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
   conversionRateCount: ConversionRate = { good: 0, ok: 0, bad: 0 }
   conversionRatePercentages: ConversionRate = { good: 0, ok: 0, bad: 0 }
   currentDatabase: string = 'spanner'
+  dialect: string = ''
+  structuredReport!: IStructuredReport
+  ccData: ICcTabData[] = []
   constructor(
     private data: DataService,
     private conversion: ConversionService,
     private dialog: MatDialog,
     private sidenav: SidenavService,
     private router: Router,
-    private clickEvent: ClickEventService
+    private clickEvent: ClickEventService,
+    private fetch: FetchService,
   ) {
     this.currentObject = null
   }
 
   ngOnInit(): void {
+    this.conversion.getStandardTypeToPGSQLTypemap()
+    this.conversion.getPGSQLToStandardTypeTypemap()
     this.ddlsumconvObj = this.data.getRateTypemapAndSummary()
-
     this.typemapObj = this.data.typeMap.subscribe((types) => {
       this.typeMap = types
+    })
+
+    this.defaultTypemapObj = this.data.defaultTypeMap.subscribe((types) => {
+      this.defaultTypeMap = types
     })
 
     this.ddlObj = this.data.ddl.subscribe((res) => {
@@ -74,6 +94,17 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
     this.sidenav.setMiddleColumnComponent.subscribe((flag: boolean) => {
       this.isMiddleColumnCollapse = !flag
     })
+
+    if (this.data.autoGenMap){
+      this.autoGenMapObj = this.data.autoGenMap.subscribe((autoGenMap) => {
+        this.autoGenMap = autoGenMap
+      })
+    }
+    if (this.data.treeUpdate){
+      this.rerenderObj = this.data.treeUpdate.subscribe(() => {
+        this.reRenderObjectExplorerSpanner();
+      });
+    }
 
     this.convObj = this.data.conv.subscribe((data: IConv) => {
       if (Object.keys(data.SrcSchema).length <= 0) {
@@ -101,6 +132,10 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
         this.objectExplorerInitiallyRender = true
       }
       if (this.currentObject && this.currentObject.type === ObjectExplorerNodeType.Table) {
+        this.ccData = this.currentObject
+          ? this.conversion.getCheckConstraints(this.currentObject.id, data)
+          : []
+
         this.fkData = this.currentObject
           ? this.conversion.getFkMapping(this.currentObject.id, data)
           : []
@@ -120,6 +155,7 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
           this.currentObject.id
         )
       }
+      this.dialect = (this.conv.SpDialect === "postgresql") ? "PostgreSQL" : "Google Standard SQL"
     })
 
     this.converObj = this.data.conversionRate.subscribe((rates: any) => {
@@ -147,10 +183,19 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
     this.convObj.unsubscribe()
     this.ddlObj.unsubscribe()
     this.ddlsumconvObj.unsubscribe()
+    if (this.autoGenMapObj){
+      this.autoGenMapObj.unsubscribe()
+    }
+    if (this.rerenderObj){
+      this.rerenderObj.unsubscribe();
+    }
   }
 
   updateConversionRatePercentages() {
     let tableCount: number = Object.keys(this.conversionRates).length
+    this.conversionRateCount = { good: 0, ok: 0, bad: 0 }
+    this.conversionRatePercentages = { good: 0, ok: 0, bad: 0 }
+
     for (const rate in this.conversionRates) {
       if (this.conversionRates[rate] === 'NONE' || this.conversionRates[rate] === 'EXCELLENT') {
         this.conversionRateCount.good += 1
@@ -176,25 +221,24 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
     this.srcTree = this.conversion.createTreeNodeForSource(this.conv, this.conversionRates)
   }
 
-  reRenderSidebar() {
-    this.reRenderObjectExplorerSpanner()
-  }
 
   changeCurrentObject(object: FlatNode) {
-    if (object?.type === ObjectExplorerNodeType.Table) {
+    if (object.type === ObjectExplorerNodeType.Table) {
       this.currentObject = object
-      this.tableData = this.currentObject
-        ? this.conversion.getColumnMapping(this.currentObject.id, this.conv)
-        : []
+      this.tableData = this.conversion.getColumnMapping(this.currentObject.id, this.conv)
+
+      this.ccData = this.conversion.getCheckConstraints(this.currentObject.id, this.conv)
 
       this.fkData = []
-      this.fkData = this.currentObject
-        ? this.conversion.getFkMapping(this.currentObject.id, this.conv)
-        : []
-    } else if (object?.type === ObjectExplorerNodeType.Index) {
+      this.fkData =  this.conversion.getFkMapping(this.currentObject.id, this.conv)
+    } else if (object.type === ObjectExplorerNodeType.Index) {
       this.currentObject = object
       this.indexData = this.conversion.getIndexMapping(object.parentId, this.conv, object.id)
-    } else {
+    } else if (object.type === ObjectExplorerNodeType.Sequence) {
+      this.currentObject = object
+      this.sequenceData = this.conversion.getSequenceMapping(object.id, this.conv)
+    }
+    else {
       this.currentObject = null
     }
   }
@@ -234,9 +278,7 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
       let config: IDbConfig = JSON.parse(localStorage.getItem(StorageKeys.Config)!)
       connectionDetail = config?.hostName + ' : ' + config?.port
     } else {
-      {
         connectionDetail = this.conv.DatabaseName
-      }
     }
     let viewAssesmentData: IViewAssesmentData = {
       srcDbType: this.srcDbName,
@@ -251,14 +293,83 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
     this.sidenav.setSidenavDatabaseName(this.conv.DatabaseName)
   }
   downloadSession() {
+    downloadSession(this.conv)
+  }
+
+  downloadArtifacts(){
+    let zip = new JSZip()
+    let fileNameHeader = `${this.conv.DatabaseName}`
+    this.fetch.getDStructuredReport().subscribe({
+      next: (resStructured: IStructuredReport) => {
+        let resJson = JSON.stringify(resStructured).replace(/9223372036854776000/g, '9223372036854775807')
+        let fileName = fileNameHeader + '_migration_structuredReport.json'
+        // add structured report to zip file
+        zip.file(fileName, resJson)
+        this.fetch.getDTextReport().subscribe({
+          next: (resText: string) => {
+            // add text report to zip file
+            zip.file(fileNameHeader + '_migration_textReport.txt', resText)
+            this.fetch.getDSpannerDDL().subscribe({
+              next: (resDDL: string) => {
+                // add spanner DDL to zip file
+                zip.file(fileNameHeader + '_spannerDDL.txt', resDDL)
+                let resJsonSession = JSON.stringify(this.conv).replace(/9223372036854776000/g, '9223372036854775807')
+                let sessionFileName = `${this.conv.SessionName}_${this.conv.DatabaseType}_${fileNameHeader}.json`
+                // add session to zip file
+                zip.file(sessionFileName, resJsonSession)
+                // Generate the zip file asynchronously
+                zip.generateAsync({ type: 'blob' })
+                .then((blob: Blob) => {
+                  var a = document.createElement('a');
+                  a.href = URL.createObjectURL(blob);
+                  a.download = `${fileNameHeader}_artifacts`;
+                  a.click();
+                })
+              }
+            })
+          }
+        })
+      }
+    })
+  }
+
+  // downloads structured report of the migration in JSON format
+  downloadStructuredReport(){
     var a = document.createElement('a')
-    // JS automatically converts the input (64bit INT) to '9223372036854776000' during conversion as this is the max value in JS.
-    // However the max value received from server is '9223372036854775807'
-    // Therefore an explicit replacement is necessary in the JSON content in the file.
-    let resJson = JSON.stringify(this.conv).replace(/9223372036854776000/g, '9223372036854775807')
-    a.href = 'data:text/json;charset=utf-8,' + encodeURIComponent(resJson)
-    a.download = `${this.conv.SessionName}_${this.conv.DatabaseType}_${this.conv.DatabaseName}.json`
-    a.click()
+    this.fetch.getDStructuredReport().subscribe({
+      next: (res: IStructuredReport) => {
+        let resJson = JSON.stringify(res).replace(/9223372036854776000/g, '9223372036854775807')
+        a.href = 'data:text/json;charset=utf-8,' + encodeURIComponent(resJson)
+        a.download = `${this.conv.DatabaseName}_migration_structuredReport.json`
+        a.click()
+      }
+    })
+  }
+
+  // downloads text report of the migration in text format in more human readable form
+  downloadTextReport(){
+    var a = document.createElement('a')
+    this.fetch.getDTextReport().subscribe({
+      next: (res: string) => {
+        a.href = 'data:text;charset=utf-8,' + encodeURIComponent(res)
+        a.download = `${this.conv.DatabaseName}_migration_textReport.txt`
+        a.click()
+      }
+    })
+  }
+
+  // downloads text file of Spanner's DDL of the schema. However this is optimized for reading and includes comments, foreign keys
+  // and doesn't add backticks around table and column names. This is not strictly
+	// legal Cloud Spanner DDL (Cloud Spanner doesn't currently support comments).
+  downloadDDL(){
+    var a = document.createElement('a')
+    this.fetch.getDSpannerDDL().subscribe({
+      next: (res: string) => {
+        a.href = 'data:text;charset=utf-8,' + encodeURIComponent(res)
+        a.download = `${this.conv.DatabaseName}_spannerDDL.txt`
+        a.click()
+      }
+    })
   }
 
   updateSpannerTable(data: IUpdateTableArgument) {
@@ -295,7 +406,42 @@ export class WorkspaceComponent implements OnInit, OnDestroy {
     return false
   }
   prepareMigration() {
-    this.router.navigate(['/prepare-migration'])
+    this.fetch.getTableWithErrors().subscribe({
+      next: (res: ITableIdAndName[]) => {
+        if (res != null && res.length !=0)
+        {
+          let errMsg = 'Please fix the errors for the following tables to move ahead: '+ res.map(x => x.Name).join(', ')
+          this.dialog.open(InfodialogComponent, {
+            data: { message: errMsg, type: 'error', title: 'Error in Spanner Draft' },
+            maxWidth: '500px',
+          })
+        } else if (this.isOfflineStatus) {
+          this.dialog.open(InfodialogComponent, {
+            data: { message: "Please configure spanner project id and instance id to proceed", type: 'error', title: 'Configure Spanner' },
+            maxWidth: '500px',
+          })
+        } else if (Object.keys(this.conv.SpSchema).length == 0) {
+          this.dialog.open(InfodialogComponent, {
+            data: { message: "Please restore some table(s) to proceed with the migration", type: 'error', title: 'All tables skipped' },
+            maxWidth: '500px',
+          })
+        } else {
+          this.data.verifyCheckConstraintExpression().subscribe((res:any)=>{
+            if(!res){
+              this.router.navigate(['/prepare-migration'])
+            }
+            else{
+              this.dialog.open(InfodialogComponent, {
+                data: { message: "Some of the Check constraints added or modified are invalid. Please fix to proceed", type: 'error', title: 'Modify Check Constraints' },
+                maxWidth: '500px',
+              })
+              this.data.getSummary()
+            }
+          })
+
+        }
+      }
+    })
   }
   spannerTab() {
     this.clickEvent.setTabToSpanner()
